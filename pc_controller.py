@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Exploro-Bot - version 100% Python
+Exploro-Bot PC Controller - interface Pygame + robot distant
 
-Ce script remplace la pile HTML/CSS/JS + Flask/Socket.IO par une seule
-application Python/Pygame qui garde le même fonctionnement global :
+Ce script affiche l'interface Pygame sur le PC et envoie les commandes au
+Raspberry Pi via HTTP, tout en gardant le même fonctionnement global :
 - grande carte centrale
 - panneau d'état
 - choix de stratégie naive / BFS / DFS
@@ -12,23 +12,32 @@ application Python/Pygame qui garde le même fonctionnement global :
 - destination au clic droit
 - pilotage clavier
 - exploration automatique en simulation
-- mode robot réel optionnel via robot_utils.py
+- mode robot réel distant via pi_robot_server.py
 
 Dépendance : pygame
     pip install pygame
 
 Lancement :
-    python exploro_bot_all_python.py
+    python pc_controller.py --host 192.168.137.92 --port 8765
 """
 
 from __future__ import annotations
 
+import argparse
+import json
+import os
 import math
 import random
+import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 import pygame
 
@@ -310,76 +319,87 @@ class RobotState:
 # Robot réel optionnel
 # ============================================================
 class RobotHardwareProxy:
-    def __init__(self) -> None:
-        self.instance = None
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url.rstrip('/')
         self.available = False
-        self.last_error = "robot_utils.py non chargé"
+        self.last_error = 'Serveur robot non connecté'
 
-    def init(self) -> Tuple[bool, str]:
-        if self.instance is not None:
-            self.available = True
-            return True, "Robot déjà initialisé"
+    def set_base_url(self, base_url: str) -> None:
+        self.base_url = base_url.rstrip('/')
+        self.available = False
 
+    def _request(self, method: str, path: str, payload: Optional[dict] = None, timeout: float = 1.5) -> dict:
+        url = f"{self.base_url}{path}"
+        data = None
+        headers = {'Accept': 'application/json'}
+        if payload is not None:
+            data = json.dumps(payload).encode('utf-8')
+            headers['Content-Type'] = 'application/json'
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            import robot_utils  # type: ignore
-
-            self.instance = robot_utils.Robot()
-            self.available = True
-            self.last_error = ""
-            return True, "Robot initialisé"
-        except Exception as exc:  # pragma: no cover - dépend du matériel
-            self.instance = None
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode('utf-8')
+                body = json.loads(raw) if raw else {}
+                self.available = True
+                self.last_error = ''
+                return body
+        except urllib.error.URLError as exc:
+            self.available = False
+            self.last_error = str(exc.reason if hasattr(exc, 'reason') else exc)
+            raise
+        except Exception as exc:
             self.available = False
             self.last_error = str(exc)
-            return False, f"Impossible d'initialiser le robot réel : {exc}"
+            raise
+
+    def init(self) -> Tuple[bool, str]:
+        try:
+            body = self._request('GET', '/health', timeout=1.0)
+            sensor = body.get('sensor_available', False)
+            msg = f"Serveur robot connecté ({'capteur OK' if sensor else 'capteur indisponible'})"
+            return True, msg
+        except Exception as exc:
+            return False, f"Impossible de joindre le Raspberry : {exc}"
 
     def distance(self) -> float:
-        if self.instance is None:
-            return MAX_SENSOR_RANGE
         try:
-            value = float(self.instance.get_sensor_distance())
-            return clamp(value, 0.0, MAX_SENSOR_RANGE)
+            body = self._request('GET', '/status', timeout=0.5)
+            return clamp(float(body.get('distance', MAX_SENSOR_RANGE)), 0.0, MAX_SENSOR_RANGE)
         except Exception:
             return MAX_SENSOR_RANGE
 
+    def _send_command(self, command: str) -> None:
+        try:
+            self._request('POST', '/command', {'command': command}, timeout=0.7)
+        except Exception:
+            pass
+
     def avance(self) -> None:
-        if self.instance is not None:
-            self.instance.avance()
+        self._send_command('forward')
 
     def recule(self) -> None:
-        if self.instance is not None:
-            self.instance.recule()
+        self._send_command('backward')
 
     def gauche(self) -> None:
-        if self.instance is not None:
-            self.instance.gauche()
+        self._send_command('left')
 
     def droite(self) -> None:
-        if self.instance is not None:
-            self.instance.droite()
+        self._send_command('right')
 
     def stop(self) -> None:
-        if self.instance is not None:
-            try:
-                self.instance.stop()
-            except Exception:
-                pass
+        self._send_command('stop')
 
     def cleanup(self) -> None:
-        if self.instance is not None:
-            try:
-                self.instance.cleanup()
-            except Exception:
-                pass
+        self.stop()
 
 
 # ============================================================
 # Application principale
 # ============================================================
 class ExploroBotApp:
-    def __init__(self) -> None:
+    def __init__(self, base_url: str) -> None:
         pygame.init()
-        pygame.display.set_caption("Exploro-Bot Simulation - Python only")
+        pygame.display.set_caption("Exploro-Bot PC Controller")
         self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.RESIZABLE)
         self.clock = pygame.time.Clock()
 
@@ -388,7 +408,7 @@ class ExploroBotApp:
         self.title_font = pygame.font.SysFont("Arial", 20, bold=True)
 
         self.robot = RobotState()
-        self.hardware = RobotHardwareProxy()
+        self.hardware = RobotHardwareProxy(base_url)
 
         self.running = True
         self.real_robot_mode = False
@@ -409,7 +429,8 @@ class ExploroBotApp:
         self.pending_wall_start: Optional[Tuple[float, float]] = None
 
         self.log_lines: List[str] = [
-            "Version 100% Python prête à l'emploi.",
+            "Interface PC connectée au Raspberry par HTTP.",
+            f"Serveur visé : {base_url}",
             "↑/↓ : avancer / reculer",
             "←/→ : braquage en simulation, rotation en mode robot réel",
             "E : activer/désactiver l'exploration",
@@ -470,7 +491,7 @@ class ExploroBotApp:
         checkbox_rect = pygame.Rect(self.rect_top_right.x + 8, self.rect_top_right.y + 114, self.rect_top_right.w - 16, 24)
         self.checkbox = Checkbox(
             rect=checkbox_rect,
-            label="Real robot ?",
+            label="Real robot distant ?",
             getter=lambda: self.real_robot_mode,
             setter=self.set_real_robot_mode,
         )
@@ -1109,7 +1130,14 @@ class ExploroBotApp:
 
 
 def main() -> None:
-    app = ExploroBotApp()
+    parser = argparse.ArgumentParser(description="Exploro-Bot PC controller")
+    parser.add_argument('--host', default='192.168.137.92', help='IP du Raspberry Pi')
+    parser.add_argument('--port', type=int, default=8765, help='Port HTTP du serveur robot')
+    parser.add_argument('--url', default=None, help='URL complète, ex: http://192.168.137.92:8765')
+    args = parser.parse_args()
+
+    base_url = args.url or f"http://{args.host}:{args.port}"
+    app = ExploroBotApp(base_url)
     app.run()
 
 
