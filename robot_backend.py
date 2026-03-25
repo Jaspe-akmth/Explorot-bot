@@ -15,12 +15,13 @@ import robot_utils
 
 HOST = "0.0.0.0"
 PORT = 8765
+
 WORLD_W = 6.0
 WORLD_H = 6.0
 
-# comme dans ton ancienne version
+# estimation simple, proche de ton ancienne logique
 LINEAR_SPEED_M_S = 0.10
-ANGULAR_SPEED_RAD_S = 1.25
+ANGULAR_SPEED_RAD_S = 2.20
 MAX_SENSOR_RANGE_M = 1.0
 
 app = Flask(__name__)
@@ -42,18 +43,6 @@ state = {
 
 last_motion_cmd = "stop"
 
-def get_sensor_distance_safe():
-    global robot
-    if robot is None:
-        return 1.0
-
-    try:
-        distance = robot.get_sensor_distance()
-        if distance is None:
-            return 1.0
-        return float(distance)
-    except Exception:
-        return 1.0
 
 def clamp(v: float, a: float, b: float) -> float:
     return max(a, min(b, v))
@@ -70,9 +59,10 @@ def normalize_deg(a: float) -> float:
 def ensure_robot() -> None:
     global robot
     if robot is None:
-        robot = robot_utils.Robot(speed=85)
+        robot = robot_utils.Robot(speed=90)
         state["robot_available"] = True
         state["sensor_available"] = True
+        state["last_error"] = None
 
 
 def update_pose(dt: float) -> None:
@@ -97,6 +87,20 @@ def update_pose(dt: float) -> None:
 
     state["pose"]["x"] = clamp(float(state["pose"]["x"]), 0.0, WORLD_W)
     state["pose"]["y"] = clamp(float(state["pose"]["y"]), 0.0, WORLD_H)
+
+
+def get_sensor_distance_safe() -> float:
+    global robot
+    if robot is None:
+        return 1.0
+
+    try:
+        distance = robot.get_sensor_distance()
+        if distance is None:
+            return 1.0
+        return float(distance)
+    except Exception:
+        return 1.0
 
 
 def telemetry_loop() -> None:
@@ -203,6 +207,7 @@ def stop():
 @app.post("/reset_pose")
 def reset_pose():
     global last_motion_cmd
+
     state["pose"] = {"x": WORLD_W / 2, "y": WORLD_H / 2, "angle_deg": 0.0}
     state["mode"] = "stop"
     state["distance_m"] = None

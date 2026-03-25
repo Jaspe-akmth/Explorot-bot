@@ -35,6 +35,7 @@ button.danger{color:var(--danger)}
 #mapCanvas{height:100%;min-height:650px;background:#fff}
 #robotView{background:#071638}
 .help{color:var(--muted);font-size:15px}
+.small-muted{font-size:14px;color:var(--muted)}
 @media (max-width:1180px){
   .layout{grid-template-columns:1fr}
   .canvas-card{height:760px}
@@ -64,6 +65,7 @@ button.danger{color:var(--danger)}
         <button data-cmd="stop">stop</button>
       </div>
       <p class="help">Flèches clavier = pilotage maintenu. Espace = stop. Clic droit = destination.</p>
+      <div class="small-muted">Le radar est calculé côté interface à partir de la pose simulée + la distance mesurée.</div>
     </section>
 
     <section class="card logs">
@@ -96,13 +98,19 @@ button.danger{color:var(--danger)}
 </div>
 
 <script>
-const PI_BASE = window.location.origin;
+const PI_BASE = "";
+
+const GRID_CELL_M = 0.08;
+const RADAR_MIN_M = 0.04;
+const RADAR_MAX_M = 0.95;
+const RADAR_MAX_CELLS = 2500;
+
 const state = {
   worldW: 6,
   worldH: 6,
   status: null,
   trace: [],
-  radarPoints: [],
+  occupancy: new Map(),
   logs: [],
   destination: null,
   currentCommand: 'stop',
@@ -213,7 +221,7 @@ function renderStatus(){
   const robotTxt = s.robot_available ? 'ok' : '--';
   const sensorTxt = s.sensor_available ? 'ok' : '--';
   const dist = s.distance_m == null ? '--' : `${s.distance_m.toFixed(3)} m`;
-  const radarCount = state.radarPoints.length;
+  const occCount = Array.from(state.occupancy.values()).filter(c => c.occ > 0).length;
   const err = s.last_error ? `<div style="color:#cc241d;font-weight:700">Erreur : ${s.last_error}</div>` : '';
 
   qs('#statusText').innerHTML = `
@@ -225,7 +233,7 @@ function renderStatus(){
     <div>Y : ${s.pose.y.toFixed(2)} m</div>
     <div>Angle : ${s.pose.angle_deg.toFixed(1)} °</div>
     <div>Distance : ${dist}</div>
-    <div>Points radar : ${radarCount}</div>
+    <div>Cases obstacle : ${occCount}</div>
     ${err}
   `;
 }
@@ -251,35 +259,97 @@ function maybeAppendTracePoint(x, y){
   }
 }
 
-function addRadarPointFromStatus(s){
+function cellKey(gx, gy){
+  return `${gx}:${gy}`;
+}
+
+function touchCell(gx, gy, deltaFree, deltaOcc){
+  if(gx < 0 || gy < 0) return;
+
+  const maxGX = Math.floor(state.worldW / GRID_CELL_M);
+  const maxGY = Math.floor(state.worldH / GRID_CELL_M);
+  if(gx > maxGX || gy > maxGY) return;
+
+  const key = cellKey(gx, gy);
+  let cell = state.occupancy.get(key);
+  if(!cell){
+    cell = {gx, gy, free: 0, occ: 0, touchedAt: Date.now()};
+    state.occupancy.set(key, cell);
+  }
+
+  cell.free += deltaFree;
+  cell.occ += deltaOcc;
+  cell.touchedAt = Date.now();
+
+  if(cell.free < -20) cell.free = -20;
+  if(cell.free > 20) cell.free = 20;
+  if(cell.occ < -20) cell.occ = -20;
+  if(cell.occ > 20) cell.occ = 20;
+
+  if(state.occupancy.size > RADAR_MAX_CELLS){
+    const entries = Array.from(state.occupancy.entries());
+    entries.sort((a, b) => a[1].touchedAt - b[1].touchedAt);
+    const toDelete = entries.slice(0, 300);
+    toDelete.forEach(([k]) => state.occupancy.delete(k));
+  }
+}
+
+function markRadarObservation(s){
   if(!s || s.distance_m == null) return;
 
   const dist = Number(s.distance_m);
-  if(!(dist >= 0.04 && dist <= 0.95)) return;
+  if(!(dist >= RADAR_MIN_M && dist <= RADAR_MAX_M)) return;
 
   const pose = s.pose;
   const ang = pose.angle_deg * Math.PI / 180.0;
 
-  // exactement dans l'esprit de l'ancienne version :
-  // point calculé côté frontend à partir de pose + distance
+  const step = GRID_CELL_M * 0.5;
+
+  for(let r = step; r < dist; r += step){
+    const x = pose.x + Math.sin(ang) * r;
+    const y = pose.y + Math.cos(ang) * r;
+
+    if(x < 0 || x > state.worldW || y < 0 || y > state.worldH) break;
+
+    const gx = Math.round(x / GRID_CELL_M);
+    const gy = Math.round(y / GRID_CELL_M);
+
+    touchCell(gx, gy, 1, -0.2);
+  }
+
   const ox = pose.x + Math.sin(ang) * dist;
   const oy = pose.y + Math.cos(ang) * dist;
 
-  if(!(ox >= 0 && ox <= state.worldW && oy >= 0 && oy <= state.worldH)) return;
-
-  for(const p of state.radarPoints){
-    if(Math.hypot(p.x - ox, p.y - oy) < 0.08){
-      p.hits = (p.hits || 1) + 1;
-      p.x = p.x * 0.7 + ox * 0.3;
-      p.y = p.y * 0.7 + oy * 0.3;
-      return;
-    }
+  if(ox >= 0 && ox <= state.worldW && oy >= 0 && oy <= state.worldH){
+    const gx = Math.round(ox / GRID_CELL_M);
+    const gy = Math.round(oy / GRID_CELL_M);
+    touchCell(gx, gy, 0, 3);
   }
+}
 
-  state.radarPoints.push({x: ox, y: oy, hits: 1});
+function drawOccupancy(ctx, canvas){
+  const scale = worldToCanvas(0, 0, canvas).scale;
+  const cellSize = GRID_CELL_M * scale;
 
-  if(state.radarPoints.length > 500){
-    state.radarPoints = state.radarPoints.slice(-500);
+  for(const cell of state.occupancy.values()){
+    const x = cell.gx * GRID_CELL_M;
+    const y = cell.gy * GRID_CELL_M;
+
+    const c = worldToCanvas(x, y, canvas);
+    const px = c.x - cellSize / 2;
+    const py = c.y - cellSize / 2;
+
+    const occScore = cell.occ - cell.free * 0.15;
+
+    if(occScore > 1.0){
+      const alpha = Math.min(0.9, 0.18 + occScore * 0.08);
+      ctx.fillStyle = `rgba(255, 70, 70, ${alpha})`;
+      ctx.fillRect(px, py, cellSize, cellSize);
+    } else if(cell.free > 4){
+      const alpha = Math.min(0.18, 0.03 + cell.free * 0.01);
+      ctx.fillStyle = `rgba(0, 190, 255, ${alpha})`;
+      ctx.fillRect(px, py, cellSize, cellSize);
+    }
   }
 }
 
@@ -290,6 +360,8 @@ function drawMap(){
   drawGrid(ctx, canvas);
 
   if(!state.status) return;
+
+  drawOccupancy(ctx, canvas);
 
   if(state.trace.length > 1){
     ctx.strokeStyle = '#00d9ff';
@@ -302,18 +374,6 @@ function drawMap(){
     });
     ctx.stroke();
   }
-
-  state.radarPoints.forEach(o => {
-    const p = worldToCanvas(o.x, o.y, canvas);
-    const hits = Math.max(1, Number(o.hits || 1));
-    const radius = Math.min(8, 2 + Math.log2(hits + 1) * 1.8);
-    const alpha = Math.min(0.95, 0.30 + Math.min(hits, 10) * 0.06);
-
-    ctx.fillStyle = `rgba(255, 70, 70, ${alpha})`;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
-    ctx.fill();
-  });
 
   if(state.destination){
     const d = worldToCanvas(state.destination.x, state.destination.y, canvas);
@@ -403,7 +463,7 @@ async function refresh(){
     const s = await api('/status');
     state.status = s;
     maybeAppendTracePoint(s.pose.x, s.pose.y);
-    addRadarPointFromStatus(s);
+    markRadarObservation(s);
     renderStatus();
     drawMap();
     drawRobotView();
@@ -466,10 +526,10 @@ function bind(){
     try{
       await api('/reset_pose', 'POST', {});
       state.trace = [];
-      state.radarPoints = [];
+      state.occupancy = new Map();
       state.lastTracePoint = null;
       state.currentCommand = 'stop';
-      addLog('Pose reset + obstacles effacés');
+      addLog('Pose reset + radar effacé');
       await refresh();
     }catch(err){
       addLog('Reset: ' + err.message);
@@ -482,7 +542,7 @@ function bind(){
     const cmd = btn.dataset.cmd;
     if(cmd === 'stop'){
       btn.onclick = () => setDrive('stop');
-    }else{
+    } else {
       bindHoldButton(btn, cmd);
     }
   });

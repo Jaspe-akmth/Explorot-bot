@@ -19,7 +19,7 @@ class Robot:
     Motor_B_Pin1 = 27
     Motor_B_Pin2 = 18
 
-    def __init__(self, speed=85):
+    def __init__(self, speed=99):
         pf = PIN_FACTORY
 
         self.speed = max(0, min(100, int(speed))) / 100.0
@@ -39,6 +39,7 @@ class Robot:
         self._stop_flag = threading.Event()
         self._lock = threading.Lock()
 
+        # volontairement simple, proche de ton ancienne version
         self.sensor = DistanceSensor(
             echo=self.Sensor_ECHO_Pin,
             trigger=self.Sensor_TRIGGER_Pin,
@@ -47,6 +48,7 @@ class Robot:
         )
 
     def get_sensor_distance(self):
+        # comportement proche de l'ancienne version
         return float(self.sensor.distance)
 
     def _run_motor(self, motor_func):
@@ -71,32 +73,32 @@ class Robot:
             self._move_thread.start()
 
     def motor_A(self, status):
+        # garde ton câblage d'origine
         if status == 1:
             self.b_in1.on()
             self.b_in2.off()
-            self.pwm_B.value = self.speed
         elif status == -1:
             self.b_in1.off()
             self.b_in2.on()
-            self.pwm_B.value = self.speed
         else:
             self.b_in1.off()
             self.b_in2.off()
-            self.pwm_B.value = 0.0
+
+        self.pwm_B.value = self.speed if status != 0 else 0.0
 
     def motor_B(self, status):
+        # garde ton câblage d'origine
         if status == 1:
             self.a_in1.on()
             self.a_in2.off()
-            self.pwm_A.value = self.speed
         elif status == -1:
             self.a_in1.off()
             self.a_in2.on()
-            self.pwm_A.value = self.speed
         else:
             self.a_in1.off()
             self.a_in2.off()
-            self.pwm_A.value = 0.0
+
+        self.pwm_A.value = self.speed if status != 0 else 0.0
 
     def recule(self):
         self._start(lambda: (self.motor_A(1), self.motor_B(1)))
@@ -129,7 +131,7 @@ class Robot:
         for dev in [
             self.a_in1, self.a_in2,
             self.b_in1, self.b_in2,
-            self.pwm_A, self.pwm_B
+            self.pwm_A, self.pwm_B,
         ]:
             try:
                 dev.close()
