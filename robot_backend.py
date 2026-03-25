@@ -20,7 +20,7 @@ WORLD_H = 6.0
 
 # comme dans ton ancienne version
 LINEAR_SPEED_M_S = 0.10
-ANGULAR_SPEED_RAD_S = 2.20
+ANGULAR_SPEED_RAD_S = 1.25
 MAX_SENSOR_RANGE_M = 1.0
 
 app = Flask(__name__)
@@ -42,6 +42,18 @@ state = {
 
 last_motion_cmd = "stop"
 
+def get_sensor_distance_safe():
+    global robot
+    if robot is None:
+        return 1.0
+
+    try:
+        distance = robot.get_sensor_distance()
+        if distance is None:
+            return 1.0
+        return float(distance)
+    except Exception:
+        return 1.0
 
 def clamp(v: float, a: float, b: float) -> float:
     return max(a, min(b, v))
@@ -58,11 +70,7 @@ def normalize_deg(a: float) -> float:
 def ensure_robot() -> None:
     global robot
     if robot is None:
-        robot = robot_utils.Robot(
-            drive_speed=78,
-            turn_speed=78,
-            pwm_freq_hz=1000,
-        )
+        robot = robot_utils.Robot(speed=85)
         state["robot_available"] = True
         state["sensor_available"] = True
 
@@ -102,14 +110,8 @@ def telemetry_loop() -> None:
             update_pose(dt)
 
             if robot is not None:
-                try:
-                    d = float(robot.get_sensor_distance())
-                    state["distance_m"] = clamp(d, 0.0, MAX_SENSOR_RANGE_M)
-                    state["sensor_available"] = True
-                except Exception as exc:
-                    state["distance_m"] = None
-                    state["sensor_available"] = False
-                    state["last_error"] = f"sensor: {exc}"
+                state["distance_m"] = clamp(get_sensor_distance_safe(), 0.0, MAX_SENSOR_RANGE_M)
+                state["sensor_available"] = True
         except Exception as exc:
             state["last_error"] = str(exc)
 
