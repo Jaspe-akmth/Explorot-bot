@@ -1,11 +1,15 @@
-import threading
 import time
+from statistics import median
 
 from gpiozero import DigitalOutputDevice, PWMOutputDevice, DistanceSensor
 from gpiozero.pins.lgpio import LGPIOFactory
 
 
 PIN_FACTORY = LGPIOFactory()
+
+
+def clamp_pct(v):
+    return max(0, min(100, int(v)))
 
 
 class Robot:
@@ -19,56 +23,44 @@ class Robot:
     Motor_B_Pin1 = 27
     Motor_B_Pin2 = 18
 
-    def __init__(self, speed=70):
-        self.speed = max(0, min(100, speed)) / 100.0
-
+    def __init__(self, drive_speed=78, turn_speed=78, pwm_freq_hz=1000):
         pf = PIN_FACTORY
 
-        self.pwm_A = PWMOutputDevice(self.Motor_A_EN, frequency=1000, pin_factory=pf)
-        self.pwm_B = PWMOutputDevice(self.Motor_B_EN, frequency=1000, pin_factory=pf)
+        self.drive_speed = clamp_pct(drive_speed)
+        self.turn_speed = clamp_pct(turn_speed)
+        self.pwm_freq_hz = int(pwm_freq_hz)
+
+        self.pwm_A = PWMOutputDevice(
+            self.Motor_A_EN,
+            frequency=self.pwm_freq_hz,
+            pin_factory=pf,
+        )
+        self.pwm_B = PWMOutputDevice(
+            self.Motor_B_EN,
+            frequency=self.pwm_freq_hz,
+            pin_factory=pf,
+        )
 
         self.a_in1 = DigitalOutputDevice(self.Motor_A_Pin1, pin_factory=pf)
         self.a_in2 = DigitalOutputDevice(self.Motor_A_Pin2, pin_factory=pf)
         self.b_in1 = DigitalOutputDevice(self.Motor_B_Pin1, pin_factory=pf)
         self.b_in2 = DigitalOutputDevice(self.Motor_B_Pin2, pin_factory=pf)
 
-        self.pwm_A.value = 0.0
-        self.pwm_B.value = 0.0
-
-        self._move_thread = None
-        self._stop_flag = threading.Event()
-        self._lock = threading.Lock()
-
         self.sensor = DistanceSensor(
             echo=self.Sensor_ECHO_Pin,
             trigger=self.Sensor_TRIGGER_Pin,
             max_distance=1.0,
+            queue_len=5,
             pin_factory=pf,
         )
 
-    def get_sensor_distance(self):
-        return float(self.sensor.distance)
-
-    def _run_motor(self, motor_func):
-        self._stop_flag.clear()
-        motor_func()
-        while not self._stop_flag.is_set():
-            time.sleep(0.01)
         self.stop()
 
-    def _start(self, motor_func):
-        with self._lock:
-            if self._move_thread and self._move_thread.is_alive():
-                self._stop_flag.set()
-                self._move_thread.join(timeout=1.0)
+    def set_drive_speed(self, pct):
+        self.drive_speed = clamp_pct(pct)
 
-            self._stop_flag.clear()
-            self._move_thread = threading.Thread(
-                target=self._run_motor,
-                args=(motor_func,),
-                daemon=True,
-            )
-            self._move_thread.start()
+    def set_turn_speed(self, pct):
+        self.turn_speed = clamp_pct(pct)
 
     def _set_motor_outputs(self, in1, in2, status):
         if status == 1:
@@ -81,37 +73,59 @@ class Robot:
             in1.off()
             in2.off()
 
-    # Garde ton mapping de câblage actuel
-    def motor_A(self, status):
+    def _set_left_motor(self, status, speed_pct):
+        # garde ton câblage d'origine
         self._set_motor_outputs(self.b_in1, self.b_in2, status)
-        self.pwm_B.value = self.speed if status != 0 else 0.0
+        self.pwm_B.value = (speed_pct / 100.0) if status != 0 else 0.0
 
-    def motor_B(self, status):
+    def _set_right_motor(self, status, speed_pct):
+        # garde ton câblage d'origine
         self._set_motor_outputs(self.a_in1, self.a_in2, status)
-        self.pwm_A.value = self.speed if status != 0 else 0.0
+        self.pwm_A.value = (speed_pct / 100.0) if status != 0 else 0.0
 
-    def recule(self):
-        self._start(lambda: (self.motor_A(1), self.motor_B(1)))
+    def _apply(self, left_status, right_status, left_speed_pct, right_speed_pct):
+        self._set_left_motor(left_status, left_speed_pct)
+        self._set_right_motor(right_status, right_speed_pct)
 
     def avance(self):
-        self._start(lambda: (self.motor_A(-1), self.motor_B(-1)))
+        self._apply(-1, -1, self.drive_speed, self.drive_speed)
+
+    def recule(self):
+        self._apply(1, 1, self.drive_speed, self.drive_speed)
 
     def gauche(self):
-        self._start(lambda: (self.motor_A(-1), self.motor_B(1)))
+        self._apply(-1, 1, self.turn_speed, self.turn_speed)
 
     def droite(self):
-        self._start(lambda: (self.motor_A(1), self.motor_B(-1)))
+        self._apply(1, -1, self.turn_speed, self.turn_speed)
 
     def stop(self):
-        self._stop_flag.set()
-        self.motor_A(0)
-        self.motor_B(0)
+        self._apply(0, 0, 0, 0)
+
+    def get_sensor_distance(self):
+        vals = []
+        for _ in range(5):
+            try:
+                d = float(self.sensor.distance)
+                if 0.02 <= d <= 1.0:
+                    vals.append(d)
+            except Exception:
+                pass
+            time.sleep(0.008)
+
+        if not vals:
+            return 1.0
+
+        d = median(vals)
+
+        if d < 0.02:
+            d = 0.02
+        if d > 1.0:
+            d = 1.0
+        return d
 
     def cleanup(self):
         self.stop()
-
-        if self._move_thread and self._move_thread.is_alive():
-            self._move_thread.join(timeout=1.0)
 
         try:
             self.sensor.close()
@@ -121,7 +135,7 @@ class Robot:
         for dev in [
             self.a_in1, self.a_in2,
             self.b_in1, self.b_in2,
-            self.pwm_A, self.pwm_B
+            self.pwm_A, self.pwm_B,
         ]:
             try:
                 dev.close()

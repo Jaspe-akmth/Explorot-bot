@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import threading
 import time
 from typing import Optional
@@ -16,12 +17,13 @@ HOST = "0.0.0.0"
 PORT = 8765
 WORLD_W = 6.0
 WORLD_H = 6.0
-LINEAR_SPEED_M_S = 0.11
-ANGULAR_SPEED_RAD_S = 2.25
+
+# comme dans ton ancienne version
+LINEAR_SPEED_M_S = 0.10
+ANGULAR_SPEED_RAD_S = 2.20
 MAX_SENSOR_RANGE_M = 1.0
 
 app = Flask(__name__)
-import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CORS(app)
 
@@ -38,8 +40,12 @@ state = {
     "last_error": None,
 }
 
+last_motion_cmd = "stop"
+
+
 def clamp(v: float, a: float, b: float) -> float:
     return max(a, min(b, v))
+
 
 def normalize_deg(a: float) -> float:
     while a > 180.0:
@@ -48,12 +54,18 @@ def normalize_deg(a: float) -> float:
         a += 360.0
     return a
 
+
 def ensure_robot() -> None:
     global robot
     if robot is None:
-        robot = robot_utils.Robot()
+        robot = robot_utils.Robot(
+            drive_speed=78,
+            turn_speed=78,
+            pwm_freq_hz=1000,
+        )
         state["robot_available"] = True
         state["sensor_available"] = True
+
 
 def update_pose(dt: float) -> None:
     mode = state["mode"]
@@ -78,6 +90,7 @@ def update_pose(dt: float) -> None:
     state["pose"]["x"] = clamp(float(state["pose"]["x"]), 0.0, WORLD_W)
     state["pose"]["y"] = clamp(float(state["pose"]["y"]), 0.0, WORLD_H)
 
+
 def telemetry_loop() -> None:
     while True:
         time.sleep(0.05)
@@ -100,10 +113,16 @@ def telemetry_loop() -> None:
         except Exception as exc:
             state["last_error"] = str(exc)
 
-def set_mode(mode: str) -> None:
+
+def apply_robot_mode(mode: str) -> None:
+    global last_motion_cmd
+
     state["mode"] = mode
 
     if robot is None:
+        return
+
+    if mode == last_motion_cmd:
         return
 
     if mode == "forward":
@@ -117,25 +136,33 @@ def set_mode(mode: str) -> None:
     else:
         robot.stop()
 
+    last_motion_cmd = mode
+
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "message": "robot backend actif"})
 
+
 @app.get("/status")
 def status():
     return jsonify(state)
+
 
 @app.post("/init")
 def init_robot():
     try:
         with robot_lock:
             ensure_robot()
+            apply_robot_mode("stop")
         return jsonify({"ok": True, "message": "robot initialisé", "robot_available": True})
     except Exception as exc:
         state["robot_available"] = False
         state["sensor_available"] = False
         state["last_error"] = str(exc)
         return jsonify({"ok": False, "message": f"init impossible: {exc}"}), 500
+
+
 @app.post("/move")
 def move():
     data = request.get_json(force=True, silent=True) or {}
@@ -151,48 +178,64 @@ def move():
                     "ok": False,
                     "message": "robot non initialisé, clique d'abord sur Init robot"
                 }), 400
-            set_mode(cmd)
+            apply_robot_mode(cmd)
         return jsonify({"ok": True, "mode": state["mode"]})
     except Exception as exc:
         state["last_error"] = str(exc)
         return jsonify({"ok": False, "message": str(exc)}), 500
+
+
 @app.post("/stop")
 def stop():
     try:
         with robot_lock:
             if robot is not None:
                 robot.stop()
-            state["mode"] = "stop"
+            apply_robot_mode("stop")
         return jsonify({"ok": True, "mode": "stop"})
     except Exception as exc:
         state["last_error"] = str(exc)
         return jsonify({"ok": False, "message": str(exc)}), 500
 
+
 @app.post("/reset_pose")
 def reset_pose():
+    global last_motion_cmd
     state["pose"] = {"x": WORLD_W / 2, "y": WORLD_H / 2, "angle_deg": 0.0}
     state["mode"] = "stop"
+    state["distance_m"] = None
+    state["last_error"] = None
+    last_motion_cmd = "stop"
+
+    if robot is not None:
+        robot.stop()
+
     return jsonify({"ok": True})
+
 
 @app.post("/cleanup")
 def cleanup():
-    global robot
+    global robot, last_motion_cmd
     try:
         with robot_lock:
             if robot is not None:
                 robot.cleanup()
             robot = None
+            last_motion_cmd = "stop"
             state["robot_available"] = False
             state["sensor_available"] = False
             state["mode"] = "stop"
+            state["distance_m"] = None
         return jsonify({"ok": True})
     except Exception as exc:
         state["last_error"] = str(exc)
         return jsonify({"ok": False, "message": str(exc)}), 500
 
+
 @app.get("/")
 def index():
     return send_from_directory(BASE_DIR, "frontend_robot.html")
+
 
 if __name__ == "__main__":
     threading.Thread(target=telemetry_loop, daemon=True).start()
