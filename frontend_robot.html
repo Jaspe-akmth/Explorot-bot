@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Exploro Bot Frontend</title>
+<style>
+:root{
+  --bg:#eef2f7; --card:#ffffff; --line:#d8e0eb; --text:#0f2748; --muted:#5b6f8b;
+  --blue:#3164e0; --danger:#e33b30; --robot:#101010; --trace:#00d9ff; --dest:#ffb300; --obs:#ff5f5f;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text)}
+.layout{display:grid;grid-template-columns:360px 1fr 380px;gap:16px;padding:16px;min-height:100vh}
+.card{background:#fff;border:1px solid var(--line);border-radius:22px;box-shadow:0 8px 20px rgba(18,35,61,.06);padding:16px;margin-bottom:16px}
+h2{margin:0 0 14px 0;font-size:24px}
+.status-grid{display:grid;gap:6px;font-size:18px;line-height:1.35}
+.online{color:#118c35;font-weight:700}.offline{color:#cc241d;font-weight:700}
+.btn-row,.cmd-grid{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
+button{font-size:18px;border:1px solid #c8d3e0;background:#fff;border-radius:14px;padding:12px 16px;cursor:pointer}
+button.primary{background:var(--blue);color:#fff;border-color:var(--blue)}button.danger{color:var(--danger)}
+.logs pre{margin:0;background:#f8fbff;border:1px solid var(--line);border-radius:16px;padding:12px;min-height:220px;max-height:320px;overflow:auto;white-space:pre-wrap;font-size:15px}
+.canvas-card{height:calc(100vh - 32px);display:flex;flex-direction:column}
+.canvas-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}
+.legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:14px}
+.dot{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:6px;vertical-align:-1px}
+.dot.robot{background:var(--robot)}.dot.dest{background:var(--dest)}.dot.obs{background:var(--obs)}.dot.trace{background:var(--trace)}
+#mapCanvas,#robotView{width:100%;border:1px solid var(--line);border-radius:18px}
+#mapCanvas{height:100%;min-height:650px;background:#fff}
+#robotView{background:#071638}
+.help{color:var(--muted);font-size:15px}
+@media (max-width:1180px){.layout{grid-template-columns:1fr}.canvas-card{height:760px}}
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <section class="card">
+      <h2>État</h2>
+      <div id="statusText" class="status-grid"></div>
+      <div class="btn-row">
+        <button id="btnInit" class="primary">Init robot</button>
+        <button id="btnReset">Reset pose</button>
+        <button id="btnStop" class="danger">STOP</button>
+      </div>
+    </section>
+    <section class="card">
+      <h2>Commandes</h2>
+      <div class="cmd-grid">
+        <button data-cmd="forward">↑ avancer</button>
+        <button data-cmd="backward">↓ reculer</button>
+        <button data-cmd="left">← gauche</button>
+        <button data-cmd="right">→ droite</button>
+        <button data-cmd="stop">stop</button>
+      </div>
+      <p class="help">Flèches clavier = pilotage. Clic droit = destination. Clic gauche x2 = obstacle.</p>
+    </section>
+    <section class="card logs">
+      <h2>Journal</h2>
+      <pre id="logBox"></pre>
+    </section>
+  </aside>
+  <main>
+    <section class="card canvas-card">
+      <div class="canvas-head">
+        <h2>Carte</h2>
+        <div class="legend">
+          <span><i class="dot robot"></i> robot</span>
+          <span><i class="dot dest"></i> destination</span>
+          <span><i class="dot obs"></i> obstacle</span>
+          <span><i class="dot trace"></i> trace</span>
+        </div>
+      </div>
+      <canvas id="mapCanvas"></canvas>
+    </section>
+  </main>
+  <aside>
+    <section class="card">
+      <h2>Vue robot</h2>
+      <canvas id="robotView" width="360" height="500"></canvas>
+    </section>
+  </aside>
+</div>
+
+<script>
+const PI_BASE = "http://192.168.137.92:8765";
+
+const state = {
+  worldW: 6, worldH: 6,
+  status: null,
+  trace: [],
+  logs: [],
+  destination: null,
+  obstacles: [],
+  pendingObstacleStart: null,
+};
+
+function qs(s){ return document.querySelector(s); }
+
+function addLog(msg){
+  const d = new Date();
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mm = String(d.getMinutes()).padStart(2,'0');
+  const ss = String(d.getSeconds()).padStart(2,'0');
+  state.logs.push(`[${hh}:${mm}:${ss}] ${msg}`);
+  state.logs = state.logs.slice(-150);
+  const box = qs('#logBox');
+  box.textContent = state.logs.slice(-20).join('\n');
+  box.scrollTop = box.scrollHeight;
+}
+
+async function api(path, method='GET', payload=null){
+  const opts = {method, headers:{}};
+  if(payload !== null){
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(payload);
+  }
+  const r = await fetch(PI_BASE + path, opts);
+  const data = await r.json();
+  if(!r.ok || data.ok === false){
+    throw new Error(data.message || `HTTP ${r.status}`);
+  }
+  return data;
+}
+
+function resizeCanvas(canvas){
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(10, Math.round(rect.width * dpr));
+  const h = Math.max(10, Math.round(rect.height * dpr));
+  if(canvas.width !== w || canvas.height !== h){
+    canvas.width = w;
+    canvas.height = h;
+  }
+}
+
+function worldToCanvas(x,y,canvas){
+  const pad = 24, w = canvas.width, h = canvas.height;
+  const scale = Math.min((w-pad*2)/state.worldW,(h-pad*2)/state.worldH);
+  const ox = (w - state.worldW*scale)/2, oy = (h - state.worldH*scale)/2;
+  return {x: ox + x*scale, y: oy + (state.worldH-y)*scale, scale};
+}
+
+function canvasToWorld(px,py,canvas){
+  const pad = 24, w = canvas.width, h = canvas.height;
+  const scale = Math.min((w-pad*2)/state.worldW,(h-pad*2)/state.worldH);
+  const ox = (w - state.worldW*scale)/2, oy = (h - state.worldH*scale)/2;
+  return {
+    x: Math.max(0, Math.min(state.worldW, (px-ox)/scale)),
+    y: Math.max(0, Math.min(state.worldH, state.worldH - ((py-oy)/scale))),
+  };
+}
+
+function drawGrid(ctx,canvas){
+  const pad = 24, w = canvas.width, h = canvas.height;
+  const scale = Math.min((w-pad*2)/state.worldW,(h-pad*2)/state.worldH);
+  const ox = (w - state.worldW*scale)/2, oy = (h - state.worldH*scale)/2;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0,0,w,h);
+  ctx.strokeStyle = '#dfe7f1';
+  ctx.lineWidth = 1;
+  for(let x=0;x<=state.worldW*10;x++){
+    const px=ox+(x/10)*scale;
+    ctx.beginPath();
+    ctx.moveTo(px,oy);
+    ctx.lineTo(px,oy+state.worldH*scale);
+    ctx.stroke();
+  }
+  for(let y=0;y<=state.worldH*10;y++){
+    const py=oy+(y/10)*scale;
+    ctx.beginPath();
+    ctx.moveTo(ox,py);
+    ctx.lineTo(ox+state.worldW*scale,py);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = '#b8c6d8';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(ox,oy,state.worldW*scale,state.worldH*scale);
+}
+
+function renderStatus(){
+  const s = state.status;
+  if(!s) return;
+  const robotCls = s.robot_available ? 'online' : 'offline';
+  const robotTxt = s.robot_available ? 'ok' : '--';
+  const dist = s.distance_m == null ? '--' : `${s.distance_m.toFixed(3)} m`;
+  qs('#statusText').innerHTML = `
+    <div>Backend : <span class="online">en ligne</span></div>
+    <div>Robot : <span class="${robotCls}">${robotTxt}</span></div>
+    <div>Capteur : ${s.sensor_available ? 'ok' : '--'}</div>
+    <div>Mode : ${s.mode}</div>
+    <div>X : ${s.pose.x.toFixed(2)} m</div>
+    <div>Y : ${s.pose.y.toFixed(2)} m</div>
+    <div>Angle : ${s.pose.angle_deg.toFixed(1)} °</div>
+    <div>Distance : ${dist}</div>`;
+}
+
+function drawMap(){
+  const canvas = qs('#mapCanvas');
+  resizeCanvas(canvas);
+  const ctx = canvas.getContext('2d');
+  drawGrid(ctx,canvas);
+  if(!state.status) return;
+
+  if(state.trace.length > 1){
+    ctx.strokeStyle = '#00d9ff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    state.trace.forEach((p,i)=>{
+      const c=worldToCanvas(p.x,p.y,canvas);
+      if(i===0) ctx.moveTo(c.x,c.y);
+      else ctx.lineTo(c.x,c.y);
+    });
+    ctx.stroke();
+  }
+
+  state.obstacles.forEach(o=>{
+    const a = worldToCanvas(o.x1,o.y1,canvas), b = worldToCanvas(o.x2,o.y2,canvas);
+    const x=Math.min(a.x,b.x), y=Math.min(a.y,b.y), w=Math.abs(b.x-a.x), h=Math.abs(b.y-a.y);
+    ctx.fillStyle='rgba(255,95,95,.55)';
+    ctx.strokeStyle='#dd3e3e';
+    ctx.lineWidth=2;
+    ctx.fillRect(x,y,w,h);
+    ctx.strokeRect(x,y,w,h);
+  });
+
+  if(state.pendingObstacleStart){
+    const p = worldToCanvas(state.pendingObstacleStart.x,state.pendingObstacleStart.y,canvas);
+    ctx.fillStyle='#ff5f5f';
+    ctx.beginPath();
+    ctx.arc(p.x,p.y,6,0,Math.PI*2);
+    ctx.fill();
+  }
+
+  if(state.destination){
+    const d = worldToCanvas(state.destination.x,state.destination.y,canvas);
+    ctx.strokeStyle='#ffb300';
+    ctx.lineWidth=3;
+    ctx.beginPath();
+    ctx.arc(d.x,d.y,14,0,Math.PI*2);
+    ctx.stroke();
+  }
+
+  const p = state.status.pose;
+  const r = worldToCanvas(p.x,p.y,canvas);
+  const robotPx = Math.max(10, r.scale*0.11);
+  const ang = (-p.angle_deg) * Math.PI/180.0;
+  ctx.save();
+  ctx.translate(r.x,r.y);
+  ctx.rotate(ang);
+  ctx.fillStyle='#101010';
+  ctx.fillRect(-robotPx*0.9,-robotPx*0.7,robotPx*1.8,robotPx*1.4);
+  ctx.strokeStyle='#ffcc00';
+  ctx.lineWidth=3;
+  ctx.beginPath();
+  ctx.moveTo(0,0);
+  ctx.lineTo(robotPx*1.5,0);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawRobotView(){
+  const canvas = qs('#robotView');
+  resizeCanvas(canvas);
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  const grad = ctx.createLinearGradient(0,0,0,h);
+  grad.addColorStop(0,'#081739');
+  grad.addColorStop(1,'#0c2450');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0,0,w,h);
+  if(!state.status) return;
+  ctx.fillStyle='#15356a';
+  ctx.fillRect(0,h*0.55,w,h*0.45);
+  const dist = state.status.distance_m == null ? 0.5 : Math.max(0.1, state.status.distance_m);
+  const barW = Math.max(30, 200 / dist), barH = Math.max(40, 250 / dist);
+  const x=(w-barW)/2, y=h*0.56-barH/2;
+  ctx.fillStyle='rgba(255,207,84,.80)';
+  ctx.fillRect(x,y,barW,barH);
+  ctx.strokeStyle='#ffe08a';
+  ctx.lineWidth=3;
+  ctx.strokeRect(x,y,barW,barH);
+}
+
+async function refresh(){
+  try{
+    const s = await api('/status');
+    state.status = s;
+    state.trace.push({x:s.pose.x, y:s.pose.y});
+    state.trace = state.trace.slice(-5000);
+    renderStatus();
+    drawMap();
+    drawRobotView();
+  }catch(err){
+    addLog('Erreur status: ' + err.message);
+  }
+}
+
+async function sendMove(cmd){
+  try{
+    await api('/move', 'POST', {command: cmd});
+    addLog('Commande: ' + cmd);
+    await refresh();
+  }catch(err){
+    addLog('Erreur commande: ' + err.message);
+  }
+}
+
+function bind(){
+  qs('#btnInit').onclick = async ()=>{
+    try{
+      await api('/init','POST',{});
+      addLog('Robot initialisé');
+      await refresh();
+    }catch(err){
+      addLog('Init: ' + err.message);
+    }
+  };
+
+  qs('#btnReset').onclick = async ()=>{
+    try{
+      await api('/reset_pose','POST',{});
+      state.trace=[];
+      addLog('Pose reset');
+      await refresh();
+    }catch(err){
+      addLog('Reset: ' + err.message);
+    }
+  };
+
+  qs('#btnStop').onclick = ()=>sendMove('stop');
+
+  document.querySelectorAll('[data-cmd]').forEach(btn=>{
+    btn.onclick=()=>sendMove(btn.dataset.cmd);
+  });
+
+  window.addEventListener('keydown', e=>{
+    const map={ArrowUp:'forward',ArrowDown:'backward',ArrowLeft:'left',ArrowRight:'right',' ':'stop'};
+    const cmd=map[e.key];
+    if(cmd){
+      e.preventDefault();
+      sendMove(cmd);
+    }
+  });
+
+  window.addEventListener('keyup', e=>{
+    if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)){
+      e.preventDefault();
+      sendMove('stop');
+    }
+  });
+
+  const canvas = qs('#mapCanvas');
+  canvas.addEventListener('contextmenu', e=>e.preventDefault());
+
+  canvas.addEventListener('mousedown', e=>{
+    const rect=canvas.getBoundingClientRect();
+    const dpr=window.devicePixelRatio||1;
+    const p=canvasToWorld((e.clientX-rect.left)*dpr, (e.clientY-rect.top)*dpr, canvas);
+
+    if(e.button===2){
+      state.destination={x:p.x,y:p.y};
+      addLog(`Destination: (${p.x.toFixed(2)}, ${p.y.toFixed(2)})`);
+    } else {
+      if(state.pendingObstacleStart==null){
+        state.pendingObstacleStart={x:p.x,y:p.y};
+        addLog(`Obstacle point 1: (${p.x.toFixed(2)}, ${p.y.toFixed(2)})`);
+      } else {
+        const a=state.pendingObstacleStart;
+        state.obstacles.push({
+          x1:Math.min(a.x,p.x),
+          y1:Math.min(a.y,p.y),
+          x2:Math.max(a.x,p.x),
+          y2:Math.max(a.y,p.y)
+        });
+        state.pendingObstacleStart=null;
+        addLog('Obstacle ajouté');
+      }
+    }
+    drawMap();
+  });
+
+  window.addEventListener('resize', ()=>{
+    drawMap();
+    drawRobotView();
+  });
+}
+
+bind();
+refresh();
+setInterval(refresh, 250);
+</script>
+</body>
+</html>

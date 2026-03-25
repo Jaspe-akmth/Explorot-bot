@@ -1,86 +1,95 @@
-import RPi.GPIO as GPIO
-from gpiozero import DistanceSensor
 import threading
 import time
+
+from gpiozero import DigitalOutputDevice, PWMOutputDevice, DistanceSensor
+from gpiozero.pins.lgpio import LGPIOFactory
+
+
+PIN_FACTORY = LGPIOFactory()
+
 
 class Robot:
     Sensor_ECHO_Pin = 8
     Sensor_TRIGGER_Pin = 11
+
     Motor_A_EN = 4
     Motor_B_EN = 17
     Motor_A_Pin1 = 26
     Motor_A_Pin2 = 21
     Motor_B_Pin1 = 27
     Motor_B_Pin2 = 18
-    def __init__(self, speed=100):
-        GPIO.setwarnings(False)
-        GPIO.setmode(GPIO.BCM)
 
-        GPIO.setup(self.Motor_A_EN, GPIO.OUT)
-        GPIO.setup(self.Motor_B_EN, GPIO.OUT)
-        GPIO.setup(self.Motor_A_Pin1, GPIO.OUT)
-        GPIO.setup(self.Motor_A_Pin2, GPIO.OUT)
-        GPIO.setup(self.Motor_B_Pin1, GPIO.OUT)
-        GPIO.setup(self.Motor_B_Pin2, GPIO.OUT)
+    def __init__(self, speed=70):
+        self.speed = max(0, min(100, speed)) / 100.0
 
-        self.pwm_A = GPIO.PWM(self.Motor_A_EN, 1000)
-        self.pwm_B = GPIO.PWM(self.Motor_B_EN, 1000)
-        self.pwm_A.start(0)
-        self.pwm_B.start(0)
+        pf = PIN_FACTORY
 
-        self.speed = speed
+        self.pwm_A = PWMOutputDevice(self.Motor_A_EN, frequency=1000, pin_factory=pf)
+        self.pwm_B = PWMOutputDevice(self.Motor_B_EN, frequency=1000, pin_factory=pf)
+
+        self.a_in1 = DigitalOutputDevice(self.Motor_A_Pin1, pin_factory=pf)
+        self.a_in2 = DigitalOutputDevice(self.Motor_A_Pin2, pin_factory=pf)
+        self.b_in1 = DigitalOutputDevice(self.Motor_B_Pin1, pin_factory=pf)
+        self.b_in2 = DigitalOutputDevice(self.Motor_B_Pin2, pin_factory=pf)
+
+        self.pwm_A.value = 0.0
+        self.pwm_B.value = 0.0
+
         self._move_thread = None
         self._stop_flag = threading.Event()
+        self._lock = threading.Lock()
 
-        self.sensor = DistanceSensor(echo=self.Sensor_ECHO_Pin, trigger=self.Sensor_TRIGGER_Pin, max_distance=1)
+        self.sensor = DistanceSensor(
+            echo=self.Sensor_ECHO_Pin,
+            trigger=self.Sensor_TRIGGER_Pin,
+            max_distance=1.0,
+            pin_factory=pf,
+        )
 
     def get_sensor_distance(self):
-        return self.sensor.distance
+        return float(self.sensor.distance)
+
     def _run_motor(self, motor_func):
-        """Thread qui garde le moteur actif tant que _stop_flag n'est pas activé"""
         self._stop_flag.clear()
         motor_func()
         while not self._stop_flag.is_set():
             time.sleep(0.01)
         self.stop()
 
-
     def _start(self, motor_func):
-        if self._move_thread and self._move_thread.is_alive():
-            self._stop_flag.set()
-            self._move_thread.join()
-        self._move_thread = threading.Thread(target=self._run_motor, args=(motor_func,))
-        self._move_thread.start()
+        with self._lock:
+            if self._move_thread and self._move_thread.is_alive():
+                self._stop_flag.set()
+                self._move_thread.join(timeout=1.0)
 
+            self._stop_flag.clear()
+            self._move_thread = threading.Thread(
+                target=self._run_motor,
+                args=(motor_func,),
+                daemon=True,
+            )
+            self._move_thread.start()
 
-    # Fonctions moteurs
-    def motor_A(self, status):
+    def _set_motor_outputs(self, in1, in2, status):
         if status == 1:
-            GPIO.output(self.Motor_B_Pin1, GPIO.HIGH)
-            GPIO.output(self.Motor_B_Pin2, GPIO.LOW)
+            in1.on()
+            in2.off()
         elif status == -1:
-            GPIO.output(self.Motor_B_Pin1, GPIO.LOW)
-            GPIO.output(self.Motor_B_Pin2, GPIO.HIGH)
+            in1.off()
+            in2.on()
         else:
-            GPIO.output(self.Motor_B_Pin1, GPIO.LOW)
-            GPIO.output(self.Motor_B_Pin2, GPIO.LOW)
-        self.pwm_B.ChangeDutyCycle(self.speed)
+            in1.off()
+            in2.off()
 
+    # Garde ton mapping de câblage actuel
+    def motor_A(self, status):
+        self._set_motor_outputs(self.b_in1, self.b_in2, status)
+        self.pwm_B.value = self.speed if status != 0 else 0.0
 
     def motor_B(self, status):
-        if status == 1:
-            GPIO.output(self.Motor_A_Pin1, GPIO.HIGH)
-            GPIO.output(self.Motor_A_Pin2, GPIO.LOW)
-        elif status == -1:
-            GPIO.output(self.Motor_A_Pin1, GPIO.LOW)
-            GPIO.output(self.Motor_A_Pin2, GPIO.HIGH)
-        else:
-            GPIO.output(self.Motor_A_Pin1, GPIO.LOW)
-            GPIO.output(self.Motor_A_Pin2, GPIO.LOW)
-        self.pwm_A.ChangeDutyCycle(self.speed)
+        self._set_motor_outputs(self.a_in1, self.a_in2, status)
+        self.pwm_A.value = self.speed if status != 0 else 0.0
 
-
-    # Commandes de mouvement
     def recule(self):
         self._start(lambda: (self.motor_A(1), self.motor_B(1)))
 
@@ -95,13 +104,26 @@ class Robot:
 
     def stop(self):
         self._stop_flag.set()
-        GPIO.output(self.Motor_A_Pin1, GPIO.LOW)
-        GPIO.output(self.Motor_A_Pin2, GPIO.LOW)
-        GPIO.output(self.Motor_B_Pin1, GPIO.LOW)
-        GPIO.output(self.Motor_B_Pin2, GPIO.LOW)
-        self.pwm_A.ChangeDutyCycle(0)
-        self.pwm_B.ChangeDutyCycle(0)
+        self.motor_A(0)
+        self.motor_B(0)
 
     def cleanup(self):
         self.stop()
-        GPIO.cleanup()
+
+        if self._move_thread and self._move_thread.is_alive():
+            self._move_thread.join(timeout=1.0)
+
+        try:
+            self.sensor.close()
+        except Exception:
+            pass
+
+        for dev in [
+            self.a_in1, self.a_in2,
+            self.b_in1, self.b_in2,
+            self.pwm_A, self.pwm_B
+        ]:
+            try:
+                dev.close()
+            except Exception:
+                pass
