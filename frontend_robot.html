@@ -387,8 +387,7 @@ function drawMap(){
   const pose = state.status.pose;
   const r = worldToCanvas(pose.x, pose.y, canvas);
   const robotPx = Math.max(10, r.scale * 0.11);
-  const angCanvas = (-pose.angle_deg) * Math.PI / 180.0;
-
+  const angCanvas = (pose.angle_deg) * Math.PI / 180.0;
   if(state.status.distance_m != null){
     const rayLen = Math.min(state.status.distance_m, 1.0) * r.scale;
 
@@ -592,7 +591,7 @@ function bind(){
 
 bind();
 refresh();
-setInterval(refresh, 120);
+setInterval(refresh, 50);
 </script>
 </body>
 </html>

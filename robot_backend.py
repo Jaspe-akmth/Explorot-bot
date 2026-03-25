@@ -19,9 +19,8 @@ PORT = 8765
 WORLD_W = 6.0
 WORLD_H = 6.0
 
-# estimation simple, proche de ton ancienne logique
-LINEAR_SPEED_M_S = 0.10
-ANGULAR_SPEED_RAD_S = 2.20
+LINEAR_SPEED = 0.10      # m/s
+ANGULAR_SPEED = 1.22     # rad/s
 MAX_SENSOR_RANGE_M = 1.0
 
 app = Flask(__name__)
@@ -31,13 +30,21 @@ CORS(app)
 robot_lock = threading.Lock()
 robot: Optional[robot_utils.Robot] = None
 
+pose = {
+    "x": WORLD_W / 2,
+    "y": WORLD_H / 2,
+    "angle": 0.0,   # radians
+}
+
+motion_state = {
+    "mode": "stop",   # forward, backward, left, right, stop
+    "updated_at": time.time(),
+}
+
 state = {
     "robot_available": False,
     "sensor_available": False,
-    "mode": "stop",
-    "pose": {"x": WORLD_W / 2, "y": WORLD_H / 2, "angle_deg": 0.0},
     "distance_m": None,
-    "last_tick": time.time(),
     "last_error": None,
 }
 
@@ -48,12 +55,12 @@ def clamp(v: float, a: float, b: float) -> float:
     return max(a, min(b, v))
 
 
-def normalize_deg(a: float) -> float:
-    while a > 180.0:
-        a -= 360.0
-    while a < -180.0:
-        a += 360.0
-    return a
+def normalize_angle(angle: float) -> float:
+    while angle > math.pi:
+        angle -= 2 * math.pi
+    while angle < -math.pi:
+        angle += 2 * math.pi
+    return angle
 
 
 def ensure_robot() -> None:
@@ -65,28 +72,28 @@ def ensure_robot() -> None:
         state["last_error"] = None
 
 
+def set_motion(mode: str) -> None:
+    motion_state["mode"] = mode
+    motion_state["updated_at"] = time.time()
+
+
 def update_pose(dt: float) -> None:
-    mode = state["mode"]
-    angle_deg = float(state["pose"]["angle_deg"])
-    angle_rad = math.radians(angle_deg)
+    mode = motion_state["mode"]
 
     if mode == "forward":
-        state["pose"]["x"] += math.sin(angle_rad) * LINEAR_SPEED_M_S * dt
-        state["pose"]["y"] += math.cos(angle_rad) * LINEAR_SPEED_M_S * dt
+        pose["x"] += math.sin(pose["angle"]) * LINEAR_SPEED * dt
+        pose["y"] += math.cos(pose["angle"]) * LINEAR_SPEED * dt
     elif mode == "backward":
-        state["pose"]["x"] -= math.sin(angle_rad) * LINEAR_SPEED_M_S * dt
-        state["pose"]["y"] -= math.cos(angle_rad) * LINEAR_SPEED_M_S * dt
+        pose["x"] -= math.sin(pose["angle"]) * LINEAR_SPEED * dt
+        pose["y"] -= math.cos(pose["angle"]) * LINEAR_SPEED * dt
     elif mode == "left":
-        state["pose"]["angle_deg"] = normalize_deg(
-            angle_deg - math.degrees(ANGULAR_SPEED_RAD_S * dt)
-        )
+        pose["angle"] -= ANGULAR_SPEED * dt
     elif mode == "right":
-        state["pose"]["angle_deg"] = normalize_deg(
-            angle_deg + math.degrees(ANGULAR_SPEED_RAD_S * dt)
-        )
+        pose["angle"] += ANGULAR_SPEED * dt
 
-    state["pose"]["x"] = clamp(float(state["pose"]["x"]), 0.0, WORLD_W)
-    state["pose"]["y"] = clamp(float(state["pose"]["y"]), 0.0, WORLD_H)
+    pose["angle"] = normalize_angle(pose["angle"])
+    pose["x"] = clamp(float(pose["x"]), 0.0, WORLD_W)
+    pose["y"] = clamp(float(pose["y"]), 0.0, WORLD_H)
 
 
 def get_sensor_distance_safe() -> float:
@@ -104,26 +111,28 @@ def get_sensor_distance_safe() -> float:
 
 
 def telemetry_loop() -> None:
+    last_time = time.time()
+
     while True:
-        time.sleep(0.05)
         now = time.time()
-        dt = max(0.0, min(0.2, now - float(state["last_tick"])))
-        state["last_tick"] = now
+        dt = now - last_time
+        last_time = now
 
-        try:
-            update_pose(dt)
-
-            if robot is not None:
+        with robot_lock:
+            try:
+                update_pose(dt)
                 state["distance_m"] = clamp(get_sensor_distance_safe(), 0.0, MAX_SENSOR_RANGE_M)
                 state["sensor_available"] = True
-        except Exception as exc:
-            state["last_error"] = str(exc)
+            except Exception as exc:
+                state["last_error"] = str(exc)
+
+        time.sleep(0.05)   # 20 Hz, comme l'ancienne version
 
 
 def apply_robot_mode(mode: str) -> None:
     global last_motion_cmd
 
-    state["mode"] = mode
+    set_motion(mode)
 
     if robot is None:
         return
@@ -152,7 +161,18 @@ def health():
 
 @app.get("/status")
 def status():
-    return jsonify(state)
+    return jsonify({
+        "robot_available": state["robot_available"],
+        "sensor_available": state["sensor_available"],
+        "mode": motion_state["mode"],
+        "pose": {
+            "x": pose["x"],
+            "y": pose["y"],
+            "angle_deg": math.degrees(pose["angle"]),
+        },
+        "distance_m": state["distance_m"],
+        "last_error": state["last_error"],
+    })
 
 
 @app.post("/init")
@@ -185,7 +205,7 @@ def move():
                     "message": "robot non initialisé, clique d'abord sur Init robot"
                 }), 400
             apply_robot_mode(cmd)
-        return jsonify({"ok": True, "mode": state["mode"]})
+        return jsonify({"ok": True, "mode": motion_state["mode"]})
     except Exception as exc:
         state["last_error"] = str(exc)
         return jsonify({"ok": False, "message": str(exc)}), 500
@@ -207,15 +227,20 @@ def stop():
 @app.post("/reset_pose")
 def reset_pose():
     global last_motion_cmd
+    with robot_lock:
+        pose["x"] = WORLD_W / 2
+        pose["y"] = WORLD_H / 2
+        pose["angle"] = 0.0
+        set_motion("stop")
+        state["distance_m"] = None
+        state["last_error"] = None
+        last_motion_cmd = "stop"
 
-    state["pose"] = {"x": WORLD_W / 2, "y": WORLD_H / 2, "angle_deg": 0.0}
-    state["mode"] = "stop"
-    state["distance_m"] = None
-    state["last_error"] = None
-    last_motion_cmd = "stop"
-
-    if robot is not None:
-        robot.stop()
+        if robot is not None:
+            try:
+                robot.stop()
+            except Exception:
+                pass
 
     return jsonify({"ok": True})
 
@@ -231,7 +256,6 @@ def cleanup():
             last_motion_cmd = "stop"
             state["robot_available"] = False
             state["sensor_available"] = False
-            state["mode"] = "stop"
             state["distance_m"] = None
         return jsonify({"ok": True})
     except Exception as exc:
