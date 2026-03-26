@@ -12,7 +12,7 @@
 }
 *{box-sizing:border-box}
 body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text)}
-.layout{display:grid;grid-template-columns:390px 520px 400px;gap:16px;padding:16px;min-height:100vh;justify-content:center}
+.layout{display:grid;grid-template-columns:390px 1fr 400px;gap:16px;padding:16px;min-height:100vh}
 .card{background:#fff;border:1px solid var(--line);border-radius:22px;box-shadow:0 8px 20px rgba(18,35,61,.06);padding:16px;margin-bottom:16px}
 h2{margin:0 0 14px 0;font-size:24px}
 .status-grid{display:grid;gap:6px;font-size:17px;line-height:1.35}
@@ -36,7 +36,7 @@ button.active{outline:3px solid rgba(49,100,224,.20)}
 .dot.trace{background:var(--trace)}
 .dot.free{background:var(--free)}
 #mapCanvas,#robotView{width:100%;border:1px solid var(--line);border-radius:18px}
-#mapCanvas{height:100%;min-height:325px;background:#fff}
+#mapCanvas{height:100%;min-height:650px;background:#fff}
 #robotView{background:#071638;height:500px}
 .help{color:var(--muted);font-size:15px}
 .small{font-size:14px;color:var(--muted);margin-top:8px}
@@ -165,8 +165,8 @@ let pendingExplorationTimer = null;
 
 const CELL_WORLD_SIZE = 0.02;
 const SERVER_CELL_SIZE = 0.10;
-const WORLD_W = 4.0;
-const WORLD_H = 4.0;
+const WORLD_W = 6.0;
+const WORLD_H = 6.0;
 const MAX_SENSOR_RANGE = 0.5;
 const RADAR_EPSILON = 0.02;
 const RADAR_MAX_CELLS = 25000;
@@ -193,6 +193,19 @@ const state = {
     sensor_available: false,
     line_sensor_available: false,
     line_sensors: {left:false, center:false, right:false},
+    camera_available: false,
+    vision_available: false,
+    vision_last_yaw_deg: null,
+    vision_matches: 0,
+    vision_detector: 'none',
+    vision_error: null,
+    vision_visual_available: false,
+    vision_open_left: 0.5,
+    vision_open_center: 0.5,
+    vision_open_right: 0.5,
+    vision_center_blocked: false,
+    vision_preferred_turn: null,
+    vision_obstacle_confidence: 0,
     mode: 'stop',
     pose: {x: 3, y: 3, angle_deg: 0},
     distance_m: null,
@@ -226,13 +239,13 @@ const state = {
   occupancy: new Map(),
   fpsView: new Array(FPS_BAR_COUNT).fill(0.06),
   config: {
-    safe_front_clearance_m: 0.22,
-    slow_front_clearance_m: 0.30,
-    danger_front_clearance_m: 0.14,
-    algo_speed: 100,
-    wall_follow_duration_s: 1.8,
-    avoid_turn_base_s: 0.8,
-    backout_duration_s: 0.75,
+    safe_front_clearance_m: 0.09,
+    slow_front_clearance_m: 0.14,
+    danger_front_clearance_m: 0.06,
+    algo_speed: 72,
+    wall_follow_duration_s: 2.8,
+    avoid_turn_base_s: 0.42,
+    backout_duration_s: 0.55,
   },
   lastMaintenanceAt: 0,
 };
@@ -536,8 +549,7 @@ function drawMap(){
   const pose = state.status.pose;
   const robot = worldToCanvas(pose.x, pose.y, canvas);
   const angle = pose.angle_deg * Math.PI / 180.0;
-  const robotW = Math.max(10, 0.08 * robot.scale);
-  const robotH = Math.max(14, 0.12 * robot.scale);
+  const robotR = Math.max(12, 0.09 * robot.scale);
 
   const beamEnd = worldToCanvas(
     pose.x + Math.sin(angle) * state.currentEchoRange,
@@ -557,11 +569,24 @@ function drawMap(){
   ctx.save();
   ctx.translate(robot.x, robot.y);
   ctx.rotate(angle);
+
   ctx.fillStyle = '#111';
-  ctx.fillRect(-robotW / 2, -robotH / 2, robotW, robotH);
+  ctx.beginPath();
+  ctx.arc(0, 0, robotR, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = '#2f2f2f';
+  ctx.beginPath();
+  ctx.arc(0, -robotR * 0.18, robotR * 0.38, 0, Math.PI * 2);
+  ctx.fill();
+
   ctx.strokeStyle = '#ffd500';
   ctx.lineWidth = 3;
-  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -robotH / 2 - 18); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(0, -robotR - 14);
+  ctx.stroke();
+
   ctx.restore();
 }
 
@@ -620,6 +645,10 @@ function renderStatus(){
     <div>Robot : <span class="${robotCls}">${s.robot_available ? 'ok' : '--'}</span></div>
     <div>Capteur US : ${s.sensor_available ? 'ok' : '--'}</div>
     <div>LineSensor : ${s.line_sensor_available ? 'ok' : '--'} (${s.line_sensors.left ? 'L1' : 'L0'} / ${s.line_sensors.center ? 'C1' : 'C0'} / ${s.line_sensors.right ? 'R1' : 'R0'})</div>
+    <div>Caméra : ${s.camera_available ? 'ok' : '--'}${s.vision_detector ? ' (' + s.vision_detector + ')' : ''}</div>
+    <div>Yaw vision : ${s.vision_last_yaw_deg == null ? '--' : s.vision_last_yaw_deg.toFixed(1) + ' °'} / matches ${s.vision_matches ?? 0}</div>
+    <div>Ouverture vision : G ${Math.round((s.vision_open_left ?? 0.5) * 100)} / C ${Math.round((s.vision_open_center ?? 0.5) * 100)} / D ${Math.round((s.vision_open_right ?? 0.5) * 100)}</div>
+    <div>Aide évitement caméra : ${s.vision_visual_available ? ((s.vision_preferred_turn ? 'tourner ' + s.vision_preferred_turn : 'pas de côté préféré') + ' / confiance ' + Math.round((s.vision_obstacle_confidence ?? 0) * 100) + '%') : '--'}</div>
     <div>Manette : ${state.gamepad.connected ? "ok" : "--"}${state.gamepad.connected ? " (" + state.gamepad.label + ")" : ""}</div>
     <div>Moteur courant : ${titleCase(s.mode)}</div>
     <div>Exploration : ${exBadge}</div>
@@ -777,13 +806,13 @@ function numValue(id, fallback){
 
 function readExplorationConfig(){
   return {
-    safe_front_clearance_m: clamp(numValue('cfgStopCm', 22) / 100, 0.03, 0.25),
-    slow_front_clearance_m: clamp(numValue('cfgSlowCm', 30) / 100, 0.04, 0.45),
-    danger_front_clearance_m: clamp(numValue('cfgDangerCm', 14) / 100, 0.02, 0.25),
-    algo_speed: clamp(Math.round(numValue('cfgAlgoSpeed', 100)), 40, 100),
-    wall_follow_duration_s: clamp(numValue('cfgWallFollowS', 1.8), 0.6, 8.0),
-    avoid_turn_base_s: clamp(numValue('cfgAvoidTurnS', 0.80), 0.12, 1.8),
-    backout_duration_s: clamp(numValue('cfgBackoutS', 0.75), 0.12, 1.8),
+    safe_front_clearance_m: clamp(numValue('cfgStopCm', 9) / 100, 0.03, 0.25),
+    slow_front_clearance_m: clamp(numValue('cfgSlowCm', 14) / 100, 0.04, 0.45),
+    danger_front_clearance_m: clamp(numValue('cfgDangerCm', 6) / 100, 0.02, 0.25),
+    algo_speed: clamp(Math.round(numValue('cfgAlgoSpeed', 72)), 40, 100),
+    wall_follow_duration_s: clamp(numValue('cfgWallFollowS', 2.8), 0.6, 8.0),
+    avoid_turn_base_s: clamp(numValue('cfgAvoidTurnS', 0.42), 0.12, 1.8),
+    backout_duration_s: clamp(numValue('cfgBackoutS', 0.55), 0.12, 1.8),
   };
 }
 
@@ -955,6 +984,19 @@ socket.on('robotPoseUpdate', data => {
   };
   state.status.line_sensor_available = !!data.line_sensor_available;
   state.status.line_sensors = data.line_sensors || {left:false, center:false, right:false};
+  state.status.camera_available = !!data.camera_available;
+  state.status.vision_available = !!data.vision_available;
+  state.status.vision_last_yaw_deg = data.vision_last_yaw_deg == null ? null : Number(data.vision_last_yaw_deg);
+  state.status.vision_matches = Number(data.vision_matches || 0);
+  state.status.vision_detector = data.vision_detector || 'none';
+  state.status.vision_error = data.vision_error || null;
+  state.status.vision_visual_available = !!data.vision_visual_available;
+  state.status.vision_open_left = Number(data.vision_open_left ?? 0.5);
+  state.status.vision_open_center = Number(data.vision_open_center ?? 0.5);
+  state.status.vision_open_right = Number(data.vision_open_right ?? 0.5);
+  state.status.vision_center_blocked = !!data.vision_center_blocked;
+  state.status.vision_preferred_turn = data.vision_preferred_turn || null;
+  state.status.vision_obstacle_confidence = Number(data.vision_obstacle_confidence || 0);
   state.status.last_error = data.last_error || null;
   maybeAppendTracePoint(state.status.pose.x, state.status.pose.y);
   redrawAll();

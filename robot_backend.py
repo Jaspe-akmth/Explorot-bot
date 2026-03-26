@@ -20,17 +20,26 @@ except Exception:
 
 import robot_utils
 
+try:
+    from vision_localization import VisionYawLocalizer
+except Exception:
+    VisionYawLocalizer = None
+
 HOST = "0.0.0.0"
 PORT = 8765
 
 WORLD_W = 4.0
 WORLD_H = 4.0
 
-LINEAR_SPEED = 0.10      # m/s estimate from odometry integration
+LINEAR_SPEED = 0.15      # m/s estimate from odometry integration
 ANGULAR_SPEED = 1.22     # rad/s estimate from odometry integration
 MAX_SENSOR_RANGE = 0.50  # ultrasonic useful range
 MANUAL_SPEED = 90
 ALGO_SPEED = 100
+
+# Optional camera-based yaw correction (monocular vision).
+VISION_SAMPLE_PERIOD_S = 0.28
+VISION_BLEND = 0.58
 
 # Optional line sensors (very short range / binary cues).
 LINE_SENSOR_PINS = {"left": 19, "center": 16, "right": 20}
@@ -105,6 +114,8 @@ robot_lock = threading.Lock()
 robot: Optional[robot_utils.Robot] = None
 background_started = False
 line_sensors = {"left": None, "center": None, "right": None}
+vision_localizer: Optional[VisionYawLocalizer] = None
+vision_turn_odom_accum = 0.0
 
 pose = {
     "x": WORLD_W / 2,
@@ -122,6 +133,19 @@ state = {
     "sensor_available": False,
     "line_sensor_available": False,
     "line_sensors": {"left": False, "center": False, "right": False},
+    "camera_available": False,
+    "vision_available": False,
+    "vision_last_yaw_deg": None,
+    "vision_matches": 0,
+    "vision_detector": "none",
+    "vision_error": None,
+    "vision_visual_available": False,
+    "vision_open_left": 0.5,
+    "vision_open_center": 0.5,
+    "vision_open_right": 0.5,
+    "vision_center_blocked": False,
+    "vision_preferred_turn": None,
+    "vision_obstacle_confidence": 0.0,
     "distance_m": None,
     "last_error": None,
 }
@@ -271,8 +295,9 @@ def set_motion(mode: str) -> None:
     motion_state["updated_at"] = time.time()
 
 
-def update_pose(dt: float) -> None:
+def update_pose(dt: float) -> float:
     mode = motion_state["mode"]
+    angular_delta = 0.0
 
     if mode == "forward":
         ls = state.get("line_sensors", {})
@@ -286,13 +311,16 @@ def update_pose(dt: float) -> None:
         pose["x"] -= math.sin(pose["angle"]) * LINEAR_SPEED * dt
         pose["y"] -= math.cos(pose["angle"]) * LINEAR_SPEED * dt
     elif mode == "left":
-        pose["angle"] -= ANGULAR_SPEED * dt
+        angular_delta = -ANGULAR_SPEED * dt
+        pose["angle"] += angular_delta
     elif mode == "right":
-        pose["angle"] += ANGULAR_SPEED * dt
+        angular_delta = ANGULAR_SPEED * dt
+        pose["angle"] += angular_delta
 
     pose["angle"] = normalize_angle(pose["angle"])
     pose["x"] = clamp(float(pose["x"]), 0.0, WORLD_W)
     pose["y"] = clamp(float(pose["y"]), 0.0, WORLD_H)
+    return angular_delta
 
 
 def get_sensor_distance_safe() -> Optional[float]:
@@ -355,6 +383,167 @@ def read_line_sensors_safe() -> Optional[Dict[str, bool]]:
         except Exception:
             readings[name] = False
     return readings if got_any else None
+
+
+def setup_vision_localizer() -> bool:
+    global vision_localizer, vision_turn_odom_accum
+
+    if VisionYawLocalizer is None:
+        state["camera_available"] = False
+        state["vision_available"] = False
+        state["vision_error"] = "module vision_localization indisponible"
+        return False
+
+    if vision_localizer is None:
+        vision_localizer = VisionYawLocalizer(sample_period_s=VISION_SAMPLE_PERIOD_S)
+    ok = vision_localizer.start()
+    state["camera_available"] = ok
+    state["vision_available"] = ok
+    state["vision_error"] = None if ok else getattr(vision_localizer, "last_error", None)
+    state["vision_last_yaw_deg"] = None
+    state["vision_matches"] = 0
+    state["vision_visual_available"] = False
+    state["vision_open_left"] = 0.5
+    state["vision_open_center"] = 0.5
+    state["vision_open_right"] = 0.5
+    state["vision_center_blocked"] = False
+    state["vision_preferred_turn"] = None
+    state["vision_obstacle_confidence"] = 0.0
+    state["vision_detector"] = "none"
+    state["vision_visual_available"] = False
+    state["vision_open_left"] = 0.5
+    state["vision_open_center"] = 0.5
+    state["vision_open_right"] = 0.5
+    state["vision_center_blocked"] = False
+    state["vision_preferred_turn"] = None
+    state["vision_obstacle_confidence"] = 0.0
+    vision_turn_odom_accum = 0.0
+    return ok
+
+
+def close_vision_localizer() -> None:
+    global vision_localizer, vision_turn_odom_accum
+    if vision_localizer is not None:
+        try:
+            vision_localizer.close()
+        except Exception:
+            pass
+    vision_turn_odom_accum = 0.0
+    state["camera_available"] = False
+    state["vision_available"] = False
+    state["vision_last_yaw_deg"] = None
+    state["vision_matches"] = 0
+    state["vision_visual_available"] = False
+    state["vision_open_left"] = 0.5
+    state["vision_open_center"] = 0.5
+    state["vision_open_right"] = 0.5
+    state["vision_center_blocked"] = False
+    state["vision_preferred_turn"] = None
+    state["vision_obstacle_confidence"] = 0.0
+    state["vision_detector"] = "none"
+    state["vision_error"] = None
+    state["vision_visual_available"] = False
+    state["vision_open_left"] = 0.5
+    state["vision_open_center"] = 0.5
+    state["vision_open_right"] = 0.5
+    state["vision_center_blocked"] = False
+    state["vision_preferred_turn"] = None
+    state["vision_obstacle_confidence"] = 0.0
+
+
+def reset_vision_tracking() -> None:
+    global vision_turn_odom_accum
+    vision_turn_odom_accum = 0.0
+    if vision_localizer is not None:
+        try:
+            vision_localizer.reset_reference()
+        except Exception:
+            pass
+    state["vision_last_yaw_deg"] = None
+    state["vision_matches"] = 0
+    state["vision_visual_available"] = False
+    state["vision_open_left"] = 0.5
+    state["vision_open_center"] = 0.5
+    state["vision_open_right"] = 0.5
+    state["vision_center_blocked"] = False
+    state["vision_preferred_turn"] = None
+    state["vision_obstacle_confidence"] = 0.0
+
+
+def apply_vision_localization(mode: str) -> None:
+    global vision_turn_odom_accum
+
+    if vision_localizer is None:
+        state["camera_available"] = False
+        state["vision_available"] = False
+        return
+
+    info = vision_localizer.update(mode)
+    state["camera_available"] = bool(info.camera_available)
+    state["vision_available"] = bool(info.delta_angle_rad is not None)
+    state["vision_last_yaw_deg"] = info.last_yaw_deg
+    state["vision_matches"] = int(info.matches or 0)
+    state["vision_detector"] = info.detector or "none"
+    visual_scores = getattr(info, "visual_scores", {}) or {}
+    state["vision_visual_available"] = True
+    state["vision_open_left"] = float(visual_scores.get("left", 0.5))
+    state["vision_open_center"] = float(visual_scores.get("center", 0.5))
+    state["vision_open_right"] = float(visual_scores.get("right", 0.5))
+    visual_blocked = getattr(info, "visual_blocked", {}) or {}
+    state["vision_center_blocked"] = bool(visual_blocked.get("center", False))
+    state["vision_preferred_turn"] = getattr(info, "visual_preferred_turn", None)
+    state["vision_obstacle_confidence"] = float(getattr(info, "visual_confidence", 0.0) or 0.0)
+    if info.error:
+        state["vision_error"] = info.error
+
+    if info.reference_reset:
+        vision_turn_odom_accum = 0.0
+
+    if info.delta_angle_rad is None:
+        return
+
+    correction = float(info.delta_angle_rad) - float(vision_turn_odom_accum)
+    pose["angle"] = normalize_angle(pose["angle"] + correction * VISION_BLEND)
+    vision_turn_odom_accum = 0.0
+
+
+def camera_bias_radians() -> float:
+    if not state.get("vision_visual_available"):
+        return 0.0
+    conf = float(state.get("vision_obstacle_confidence") or 0.0)
+    left = float(state.get("vision_open_left") or 0.5)
+    right = float(state.get("vision_open_right") or 0.5)
+    delta = clamp(right - left, -0.45, 0.45)
+    if abs(delta) < 0.04 or conf < 0.14:
+        return 0.0
+    return clamp(delta * math.radians(18.0) * (0.45 + conf), -math.radians(18.0), math.radians(18.0))
+
+
+def visual_guided_turn(min_confidence: float = 0.22) -> Optional[str]:
+    if not state.get("vision_visual_available"):
+        return None
+    conf = float(state.get("vision_obstacle_confidence") or 0.0)
+    if conf < min_confidence:
+        return None
+    preferred = state.get("vision_preferred_turn")
+    left = float(state.get("vision_open_left") or 0.5)
+    right = float(state.get("vision_open_right") or 0.5)
+    if preferred in {"left", "right"}:
+        return preferred
+    if right - left > 0.06:
+        return "right"
+    if left - right > 0.06:
+        return "left"
+    return None
+
+
+def visual_center_blocked(min_confidence: float = 0.48) -> bool:
+    if not state.get("vision_visual_available"):
+        return False
+    conf = float(state.get("vision_obstacle_confidence") or 0.0)
+    center = float(state.get("vision_open_center") or 0.5)
+    blocked = bool(state.get("vision_center_blocked"))
+    return conf >= min_confidence and (blocked or center < 0.36)
 
 
 def line_bias_radians() -> float:
@@ -536,8 +725,6 @@ def update_occupancy_from_line_sensors(readings: Optional[Dict[str, bool]]) -> N
 
 
 def find_path_to_frontier(start: Tuple[int, int], strategy: str) -> List[Tuple[int, int]]:
-    best_cell = None
-    best_score = -1e9
     if not in_bounds(*start):
         return []
     if classify_cell(*start) == "unknown":
@@ -565,22 +752,7 @@ def find_path_to_frontier(start: Tuple[int, int], strategy: str) -> List[Tuple[i
         while fringe2:
             cell = fringe2.pop()
             if cell != start and is_frontier(*cell):
-                path_len = 0
-                cur = cell
-                while cur is not None:
-                    path_len += 1
-                    cur = parent[cur]
-
-                unknown_neighbors = sum(
-                    1 for nx, ny in neighbors8(*cell)
-                    if in_bounds(nx, ny) and classify_cell(nx, ny) == "unknown"
-                )
-
-                score = unknown_neighbors * 10.0 - path_len
-                if score > best_score:
-                    best_score = score
-                    best_cell = cell
-                continue
+                return reconstruct_path(parent, cell)
             # Reverse order so the first logical neighbor is explored deeper first.
             nbs = list(ordered_neighbors(cell))
             nbs.reverse()
@@ -589,8 +761,6 @@ def find_path_to_frontier(start: Tuple[int, int], strategy: str) -> List[Tuple[i
                     visited.add(nxt)
                     parent[nxt] = cell
                     fringe2.append(nxt)
-    if best_cell is not None:
-        return reconstruct_path(parent, best_cell)
     return []
 
 
@@ -641,11 +811,11 @@ def heading_unknown_bonus(angle: float, max_range: float = 0.45) -> float:
         seen.add((gx, gy))
         cls = classify_cell(gx, gy)
         if cls == "unknown":
-            score += 0.12
+            score += 0.055
         elif cls == "free":
-            score -= 0.005
+            score += 0.010
         else:
-            score -= 0.05
+            score -= 0.030
             break
         r += CELL_M
     return score
@@ -655,7 +825,7 @@ def current_search_heading_score() -> float:
     front = state.get("distance_m")
     ls = state.get("line_sensors", {})
     clearance = MAX_SENSOR_RANGE * 0.85 if front is None else float(front)
-    score = clearance * 1.15 + 3.0 * heading_unknown_bonus(pose["angle"])
+    score = clearance * 1.9 + heading_unknown_bonus(pose["angle"])
     if ls.get("center"):
         score -= 0.35
     if ls.get("left") and ls.get("right"):
@@ -750,6 +920,10 @@ def immediate_blocked(front_pad: float = 0.0) -> bool:
         return True
     if front is not None and front < SAFE_FRONT_CLEARANCE_M + front_pad:
         return True
+    if front is None:
+        return visual_center_blocked(0.62)
+    if front < SLOW_FRONT_CLEARANCE_M and visual_center_blocked(0.74):
+        return True
     return False
 
 
@@ -759,6 +933,10 @@ def pick_avoid_turn(preferred: Optional[str] = None) -> str:
 
     if preferred in {"left", "right"}:
         return preferred
+
+    visual_choice = visual_guided_turn(0.18)
+    if visual_choice in {"left", "right"}:
+        return visual_choice
     if ls.get("left") and not ls.get("right"):
         return "right"
     if ls.get("right") and not ls.get("left"):
@@ -912,6 +1090,8 @@ def step_wall_follow() -> None:
     now = time.time()
     ls = state.get("line_sensors", {})
     front = state.get("distance_m")
+    vision_turn = visual_guided_turn(0.22)
+    vision_blocked = visual_center_blocked(0.60)
 
     if now >= exploration.get("wall_follow_until", 0.0):
         command_stop()
@@ -921,7 +1101,7 @@ def step_wall_follow() -> None:
             start_search_sweep("wall_follow_exit")
         return
 
-    if ls.get("center") or (front is not None and front < SAFE_FRONT_CLEARANCE_M):
+    if ls.get("center") or (front is not None and front < SAFE_FRONT_CLEARANCE_M) or (front is not None and front < SLOW_FRONT_CLEARANCE_M and visual_center_blocked(0.72)):
         if side == "left":
             command_right()
         else:
@@ -942,6 +1122,15 @@ def step_wall_follow() -> None:
         return
     if side == "right" and ls.get("left") and not ls.get("right"):
         command_right()
+        return
+
+    if vision_blocked and vision_turn == "left":
+        command_left()
+        exploration["phase"] = "turn"
+        return
+    if vision_blocked and vision_turn == "right":
+        command_right()
+        exploration["phase"] = "turn"
         return
 
     command_forward()
@@ -1086,14 +1275,14 @@ def drive_to_waypoint() -> None:
     wx0, wy0 = grid_to_world(*waypoint)
     wx = wx0 + CELL_M * 0.5
     wy = wy0 + CELL_M * 0.5
-    target_angle = math.atan2(wx - pose["x"], wy - pose["y"]) + line_bias_radians() * 0.65
+    target_angle = math.atan2(wx - pose["x"], wy - pose["y"]) + line_bias_radians() * 0.65 + camera_bias_radians() * 0.55
     diff = signed_angle_diff(target_angle, pose["angle"])
     dist_wp = distance((pose["x"], pose["y"]), (wx, wy))
     front = state["distance_m"]
 
     ls = state.get("line_sensors", {})
 
-    if ls.get("center") or (front is not None and front < SAFE_FRONT_CLEARANCE_M):
+    if ls.get("center") or (front is not None and front < SAFE_FRONT_CLEARANCE_M) or (front is not None and front < SLOW_FRONT_CLEARANCE_M and visual_center_blocked(0.72)):
         command_stop()
         exploration["path"] = []
         exploration["path_index"] = 0
@@ -1129,6 +1318,15 @@ def drive_to_waypoint() -> None:
         begin_next_waypoint()
         return
 
+    if vision_blocked and vision_turn == "left":
+        command_left()
+        exploration["phase"] = "turn"
+        return
+    if vision_blocked and vision_turn == "right":
+        command_right()
+        exploration["phase"] = "turn"
+        return
+
     command_forward()
     exploration["phase"] = "move"
 
@@ -1136,6 +1334,8 @@ def drive_to_waypoint() -> None:
 def step_random_exploration() -> None:
     front = state["distance_m"]
     ls = state.get("line_sensors", {})
+    vision_turn = visual_guided_turn(0.20)
+    vision_blocked = visual_center_blocked(0.62)
 
     if handle_backout_phase():
         return
@@ -1149,10 +1349,14 @@ def step_random_exploration() -> None:
         return
 
     if front is None:
+        if vision_blocked:
+            command_stop()
+            start_search_sweep("random_visual_only")
+            return
         command_stop()
         return
 
-    if ls.get("center") or front < SAFE_FRONT_CLEARANCE_M:
+    if ls.get("center") or front < SAFE_FRONT_CLEARANCE_M or (front < SLOW_FRONT_CLEARANCE_M and vision_blocked):
         command_stop()
         start_search_sweep("random_blocked")
         return
@@ -1167,7 +1371,24 @@ def step_random_exploration() -> None:
             command_left()
             exploration["phase"] = "turn"
             return
+        if vision_turn == "right":
+            command_right()
+            exploration["phase"] = "turn"
+            return
+        if vision_turn == "left":
+            command_left()
+            exploration["phase"] = "turn"
+            return
         start_search_sweep("random_slow")
+        return
+
+    if vision_turn == "right" and vision_blocked:
+        command_right()
+        exploration["phase"] = "turn"
+        return
+    if vision_turn == "left" and vision_blocked:
+        command_left()
+        exploration["phase"] = "turn"
         return
 
     if ls.get("left") and not ls.get("right"):
@@ -1176,6 +1397,15 @@ def step_random_exploration() -> None:
         return
     if ls.get("right") and not ls.get("left"):
         command_left()
+        exploration["phase"] = "turn"
+        return
+
+    if vision_blocked and vision_turn == "left":
+        command_left()
+        exploration["phase"] = "turn"
+        return
+    if vision_blocked and vision_turn == "right":
+        command_right()
         exploration["phase"] = "turn"
         return
 
@@ -1264,6 +1494,19 @@ def emit_full_state() -> None:
         "sensor_available": state["sensor_available"],
         "line_sensor_available": state["line_sensor_available"],
         "line_sensors": state["line_sensors"],
+        "camera_available": state["camera_available"],
+        "vision_available": state["vision_available"],
+        "vision_last_yaw_deg": state["vision_last_yaw_deg"],
+        "vision_matches": state["vision_matches"],
+        "vision_detector": state["vision_detector"],
+        "vision_error": state["vision_error"],
+        "vision_visual_available": state["vision_visual_available"],
+        "vision_open_left": state["vision_open_left"],
+        "vision_open_center": state["vision_open_center"],
+        "vision_open_right": state["vision_open_right"],
+        "vision_center_blocked": state["vision_center_blocked"],
+        "vision_preferred_turn": state["vision_preferred_turn"],
+        "vision_obstacle_confidence": state["vision_obstacle_confidence"],
         "last_error": state["last_error"],
     })
 
@@ -1299,13 +1542,30 @@ def telemetry_loop() -> None:
 
         with robot_lock:
             try:
-                update_pose(dt)
+                angular_delta = update_pose(dt)
+                if motion_state["mode"] in ("left", "right"):
+                    global vision_turn_odom_accum
+                    vision_turn_odom_accum += angular_delta
+                else:
+                    vision_turn_odom_accum = 0.0
 
                 if robot is None:
                     state["distance_m"] = None
                     state["sensor_available"] = False
                     state["line_sensor_available"] = False
                     state["line_sensors"] = {"left": False, "center": False, "right": False}
+                    state["camera_available"] = False
+                    state["vision_available"] = False
+                    state["vision_last_yaw_deg"] = None
+                    state["vision_matches"] = 0
+                    state["vision_detector"] = "none"
+                    state["vision_visual_available"] = False
+                    state["vision_open_left"] = 0.5
+                    state["vision_open_center"] = 0.5
+                    state["vision_open_right"] = 0.5
+                    state["vision_center_blocked"] = False
+                    state["vision_preferred_turn"] = None
+                    state["vision_obstacle_confidence"] = 0.0
                 else:
                     d = get_sensor_distance_safe()
                     state["distance_m"] = clamp(d, 0.0, MAX_SENSOR_RANGE) if d is not None else None
@@ -1314,6 +1574,8 @@ def telemetry_loop() -> None:
                     ls = read_line_sensors_safe()
                     state["line_sensor_available"] = ls is not None
                     state["line_sensors"] = ls or {"left": False, "center": False, "right": False}
+
+                    apply_vision_localization(motion_state["mode"])
 
                 if state["distance_m"] is not None:
                     update_occupancy_from_sensor(state["distance_m"])
@@ -1374,6 +1636,8 @@ def init_gpio(_data=None):
             state["robot_available"] = True
             state["sensor_available"] = True
             state["line_sensor_available"] = setup_line_sensors()
+            setup_vision_localizer()
+            reset_vision_tracking()
             state["last_error"] = None
 
         ensure_background_task()
@@ -1399,6 +1663,7 @@ def reset_pose(_data=None):
         state["distance_m"] = None
         state["last_error"] = None
         occupancy.clear()
+        reset_vision_tracking()
         exploration["enabled"] = False
         exploration["mode"] = "idle"
         exploration["phase"] = "idle"
@@ -1597,6 +1862,7 @@ def cleanup_gpio(_data=None):
                 pass
 
         close_line_sensors()
+        close_vision_localizer()
         robot = None
         state["robot_available"] = False
         state["sensor_available"] = False
