@@ -8,7 +8,7 @@
 :root{
   --bg:#eef2f7; --card:#ffffff; --line:#d8e0eb; --text:#0f2748; --muted:#5b6f8b;
   --blue:#3164e0; --danger:#e33b30; --robot:#101010; --trace:#00d9ff; --dest:#ffb300;
-  --obs:#ff5f5f; --scan:#ff7f50;
+  --obs:#ff5f5f; --scan:#c8b400;
 }
 *{box-sizing:border-box}
 body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text)}
@@ -31,9 +31,10 @@ button.danger{color:var(--danger)}
 .dot.dest{background:var(--dest)}
 .dot.obs{background:var(--obs)}
 .dot.trace{background:var(--trace)}
+.dot.free{background:rgba(0,200,200,.8)}
 #mapCanvas,#robotView{width:100%;border:1px solid var(--line);border-radius:18px}
 #mapCanvas{height:100%;min-height:650px;background:#fff}
-#robotView{background:#071638}
+#robotView{background:#fff;height:500px}
 .help{color:var(--muted);font-size:15px}
 @media (max-width:1180px){
   .layout{grid-template-columns:1fr}
@@ -77,10 +78,11 @@ button.danger{color:var(--danger)}
       <div class="canvas-head">
         <h2>Carte</h2>
         <div class="legend">
-          <span><i class="dot robot"></i> robot</span>
-          <span><i class="dot dest"></i> destination</span>
-          <span><i class="dot obs"></i> obstacles détectés</span>
-          <span><i class="dot trace"></i> trace</span>
+          <span><i class="dot robot"></i>robot</span>
+          <span><i class="dot dest"></i>destination</span>
+          <span><i class="dot free"></i>zone libre</span>
+          <span><i class="dot obs"></i>obstacle</span>
+          <span><i class="dot trace"></i>trace</span>
         </div>
       </div>
       <canvas id="mapCanvas"></canvas>
@@ -99,14 +101,16 @@ button.danger{color:var(--danger)}
 <script>
 const socket = io();
 
-const GRID_CELL_M = 0.08;
-const RADAR_MIN_M = 0.04;
-const RADAR_MAX_M = 0.95;
-const RADAR_MAX_CELLS = 2500;
+const CELL_WORLD_SIZE = 0.01;      // 1 cm par case
+const MAX_SENSOR_RANGE = 0.5;      // fidèle à index.js
+const RADAR_EPSILON = 0.02;
+const RADAR_MAX_CELLS = 50000;
+const FPS_BAR_COUNT = 11;
 
 const state = {
   worldW: 6,
   worldH: 6,
+  currentEchoRange: MAX_SENSOR_RANGE,
   status: {
     robot_available: false,
     sensor_available: false,
@@ -116,26 +120,27 @@ const state = {
     last_error: null,
   },
   trace: [],
-  occupancy: new Map(),
-  logs: [],
+  lastTracePoint: null,
   destination: null,
   currentCommand: 'stop',
-  lastTracePoint: null,
+  logs: [],
   keys: {
     ArrowUp: false,
     ArrowDown: false,
     ArrowLeft: false,
     ArrowRight: false,
   },
+  occupancy: new Map(), // key => {gx, gy, value, touchedAt}
 };
 
-function qs(s){ return document.querySelector(s); }
+function qs(sel){ return document.querySelector(sel); }
+function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
 
 function addLog(msg){
   const d = new Date();
-  const hh = String(d.getHours()).padStart(2,'0');
-  const mm = String(d.getMinutes()).padStart(2,'0');
-  const ss = String(d.getSeconds()).padStart(2,'0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
   state.logs.push(`[${hh}:${mm}:${ss}] ${msg}`);
   state.logs = state.logs.slice(-160);
   const box = qs('#logBox');
@@ -146,8 +151,8 @@ function addLog(msg){
 function resizeCanvas(canvas){
   const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
-  const w = Math.max(10, Math.round(rect.width * dpr));
-  const h = Math.max(10, Math.round(rect.height * dpr));
+  const w = Math.max(100, Math.round(rect.width * dpr));
+  const h = Math.max(100, Math.round(rect.height * dpr));
   if(canvas.width !== w || canvas.height !== h){
     canvas.width = w;
     canvas.height = h;
@@ -155,77 +160,25 @@ function resizeCanvas(canvas){
 }
 
 function worldToCanvas(x, y, canvas){
-  const pad = 24, w = canvas.width, h = canvas.height;
-  const scale = Math.min((w - pad * 2) / state.worldW, (h - pad * 2) / state.worldH);
-  const ox = (w - state.worldW * scale) / 2;
-  const oy = (h - state.worldH * scale) / 2;
-  return {x: ox + x * scale, y: oy + (state.worldH - y) * scale, scale};
-}
-
-function canvasToWorld(px, py, canvas){
-  const pad = 24, w = canvas.width, h = canvas.height;
-  const scale = Math.min((w - pad * 2) / state.worldW, (h - pad * 2) / state.worldH);
-  const ox = (w - state.worldW * scale) / 2;
-  const oy = (h - state.worldH * scale) / 2;
+  const pad = 24;
+  const scale = Math.min((canvas.width - pad * 2) / state.worldW, (canvas.height - pad * 2) / state.worldH);
+  const ox = (canvas.width - state.worldW * scale) / 2;
+  const oy = (canvas.height - state.worldH * scale) / 2;
   return {
-    x: Math.max(0, Math.min(state.worldW, (px - ox) / scale)),
-    y: Math.max(0, Math.min(state.worldH, state.worldH - ((py - oy) / scale))),
+    x: ox + x * scale,
+    y: oy + (state.worldH - y) * scale,
+    scale,
+    ox,
+    oy,
   };
 }
 
-function drawGrid(ctx, canvas){
-  const pad = 24, w = canvas.width, h = canvas.height;
-  const scale = Math.min((w - pad * 2) / state.worldW, (h - pad * 2) / state.worldH);
-  const ox = (w - state.worldW * scale) / 2;
-  const oy = (h - state.worldH * scale) / 2;
-
-  ctx.clearRect(0,0,w,h);
-  ctx.fillStyle = '#fff';
-  ctx.fillRect(0,0,w,h);
-
-  ctx.strokeStyle = '#dfe7f1';
-  ctx.lineWidth = 1;
-  for(let x = 0; x <= state.worldW * 10; x++){
-    const px = ox + (x / 10) * scale;
-    ctx.beginPath();
-    ctx.moveTo(px, oy);
-    ctx.lineTo(px, oy + state.worldH * scale);
-    ctx.stroke();
-  }
-  for(let y = 0; y <= state.worldH * 10; y++){
-    const py = oy + (y / 10) * scale;
-    ctx.beginPath();
-    ctx.moveTo(ox, py);
-    ctx.lineTo(ox + state.worldW * scale, py);
-    ctx.stroke();
-  }
-
-  ctx.strokeStyle = '#b8c6d8';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(ox, oy, state.worldW * scale, state.worldH * scale);
-}
-
-function renderStatus(){
-  const s = state.status;
-  const robotCls = s.robot_available ? 'online' : 'offline';
-  const robotTxt = s.robot_available ? 'ok' : '--';
-  const sensorTxt = s.sensor_available ? 'ok' : '--';
-  const dist = s.distance_m == null ? '--' : `${s.distance_m.toFixed(3)} m`;
-  const occCount = Array.from(state.occupancy.values()).filter(c => c.occ > 0).length;
-  const err = s.last_error ? `<div style="color:#cc241d;font-weight:700">Erreur : ${s.last_error}</div>` : '';
-
-  qs('#statusText').innerHTML = `
-    <div>Socket : <span class="online">connectée</span></div>
-    <div>Robot : <span class="${robotCls}">${robotTxt}</span></div>
-    <div>Capteur : ${sensorTxt}</div>
-    <div>Mode : ${s.mode}</div>
-    <div>X : ${s.pose.x.toFixed(2)} m</div>
-    <div>Y : ${s.pose.y.toFixed(2)} m</div>
-    <div>Angle : ${s.pose.angle_deg.toFixed(1)} °</div>
-    <div>Distance : ${dist}</div>
-    <div>Cases obstacle : ${occCount}</div>
-    ${err}
-  `;
+function canvasToWorld(px, py, canvas){
+  const ref = worldToCanvas(0, 0, canvas);
+  return {
+    x: clamp((px - ref.ox) / ref.scale, 0, state.worldW),
+    y: clamp(state.worldH - ((py - ref.oy) / ref.scale), 0, state.worldH),
+  };
 }
 
 function maybeAppendTracePoint(x, y){
@@ -235,17 +188,14 @@ function maybeAppendTracePoint(x, y){
     return;
   }
 
-  const dx = x - state.lastTracePoint.x;
-  const dy = y - state.lastTracePoint.y;
-  const dist = Math.hypot(dx, dy);
-
-  if(dist >= 0.01){
+  const dist = Math.hypot(x - state.lastTracePoint.x, y - state.lastTracePoint.y);
+  if(dist >= CELL_WORLD_SIZE){
     state.trace.push({x, y});
     state.lastTracePoint = {x, y};
   }
 
-  if(state.trace.length > 2500){
-    state.trace = state.trace.slice(-2500);
+  if(state.trace.length > 4000){
+    state.trace = state.trace.slice(-4000);
   }
 }
 
@@ -253,86 +203,134 @@ function cellKey(gx, gy){
   return `${gx}:${gy}`;
 }
 
-function touchCell(gx, gy, deltaFree, deltaOcc){
-  if(gx < 0 || gy < 0) return;
+function worldToGrid(x, y){
+  return {
+    gx: Math.floor(x / CELL_WORLD_SIZE),
+    gy: Math.floor(y / CELL_WORLD_SIZE),
+  };
+}
 
-  const maxGX = Math.floor(state.worldW / GRID_CELL_M);
-  const maxGY = Math.floor(state.worldH / GRID_CELL_M);
-  if(gx > maxGX || gy > maxGY) return;
+function inGrid(gx, gy){
+  return gx >= 0 && gx < Math.floor(state.worldW / CELL_WORLD_SIZE) && gy >= 0 && gy < Math.floor(state.worldH / CELL_WORLD_SIZE);
+}
+
+function setCellIfUnknownOrFree(gx, gy, value){
+  if(!inGrid(gx, gy)) return;
 
   const key = cellKey(gx, gy);
   let cell = state.occupancy.get(key);
   if(!cell){
-    cell = {gx, gy, free: 0, occ: 0, touchedAt: Date.now()};
+    cell = {gx, gy, value: 0, touchedAt: Date.now()};
     state.occupancy.set(key, cell);
   }
 
-  cell.free += deltaFree;
-  cell.occ += deltaOcc;
+  if(cell.value === 2) return;        // ne remplace jamais la trace du robot
+  if(cell.value === 3 && value === 1) return; // ne remplace pas obstacle par libre
+
+  cell.value = value;
   cell.touchedAt = Date.now();
 
   if(state.occupancy.size > RADAR_MAX_CELLS){
-    const entries = Array.from(state.occupancy.entries());
-    entries.sort((a, b) => a[1].touchedAt - b[1].touchedAt);
-    entries.slice(0, 300).forEach(([k]) => state.occupancy.delete(k));
+    const entries = Array.from(state.occupancy.entries()).sort((a, b) => a[1].touchedAt - b[1].touchedAt);
+    entries.slice(0, 1000).forEach(([k]) => state.occupancy.delete(k));
   }
 }
 
+function markRobotCell(){
+  const {gx, gy} = worldToGrid(state.status.pose.x, state.status.pose.y);
+  if(!inGrid(gx, gy)) return;
+
+  const key = cellKey(gx, gy);
+  const cell = {gx, gy, value: 2, touchedAt: Date.now()};
+  state.occupancy.set(key, cell);
+}
+
 function markRadarObservation(){
-  const s = state.status;
-  if(!s || s.distance_m == null) return;
+  markRobotCell();
 
-  const dist = Number(s.distance_m);
-  if(!(dist >= RADAR_MIN_M && dist <= RADAR_MAX_M)) return;
+  const pose = state.status.pose;
+  const detectedDistance = clamp(state.currentEchoRange, 0.0, MAX_SENSOR_RANGE);
+  const obstacleDetected = detectedDistance < (MAX_SENSOR_RANGE - RADAR_EPSILON);
+  const angle = pose.angle_deg * Math.PI / 180.0;
 
-  const pose = s.pose;
-  const ang = pose.angle_deg * Math.PI / 180.0;
-  const step = GRID_CELL_M * 0.5;
+  let distance = 0.0;
+  const freeLimit = obstacleDetected
+    ? Math.max(0, detectedDistance - CELL_WORLD_SIZE)
+    : detectedDistance;
 
-  for(let r = step; r < dist; r += step){
-    const x = pose.x + Math.sin(ang) * r;
-    const y = pose.y + Math.cos(ang) * r;
+  while(distance <= freeLimit){
+    const x = pose.x + Math.sin(angle) * distance;
+    const y = pose.y + Math.cos(angle) * distance;
+    const {gx, gy} = worldToGrid(x, y);
 
-    if(x < 0 || x > state.worldW || y < 0 || y > state.worldH) break;
-
-    const gx = Math.round(x / GRID_CELL_M);
-    const gy = Math.round(y / GRID_CELL_M);
-    touchCell(gx, gy, 1, -0.2);
+    if(!inGrid(gx, gy)) break;
+    setCellIfUnknownOrFree(gx, gy, 1);
+    distance += CELL_WORLD_SIZE;
   }
 
-  const ox = pose.x + Math.sin(ang) * dist;
-  const oy = pose.y + Math.cos(ang) * dist;
+  if(obstacleDetected){
+    const obstacleX = pose.x + Math.sin(angle) * detectedDistance;
+    const obstacleY = pose.y + Math.cos(angle) * detectedDistance;
+    const {gx, gy} = worldToGrid(obstacleX, obstacleY);
 
-  if(ox >= 0 && ox <= state.worldW && oy >= 0 && oy <= state.worldH){
-    const gx = Math.round(ox / GRID_CELL_M);
-    const gy = Math.round(oy / GRID_CELL_M);
-    touchCell(gx, gy, 0, 3);
+    if(inGrid(gx, gy)){
+      const key = cellKey(gx, gy);
+      const existing = state.occupancy.get(key);
+      if(!existing || existing.value !== 2){
+        state.occupancy.set(key, {gx, gy, value: 3, touchedAt: Date.now()});
+      }
+    }
   }
+}
+
+function drawGrid(ctx, canvas){
+  const ref = worldToCanvas(0, 0, canvas);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.strokeStyle = '#dfe7f1';
+  ctx.lineWidth = 1;
+  for(let x = 0; x <= state.worldW * 10; x++){
+    const px = ref.ox + (x / 10) * ref.scale;
+    ctx.beginPath();
+    ctx.moveTo(px, ref.oy);
+    ctx.lineTo(px, ref.oy + state.worldH * ref.scale);
+    ctx.stroke();
+  }
+  for(let y = 0; y <= state.worldH * 10; y++){
+    const py = ref.oy + (y / 10) * ref.scale;
+    ctx.beginPath();
+    ctx.moveTo(ref.ox, py);
+    ctx.lineTo(ref.ox + state.worldW * ref.scale, py);
+    ctx.stroke();
+  }
+
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(ref.ox, ref.oy, state.worldW * ref.scale, state.worldH * ref.scale);
 }
 
 function drawOccupancy(ctx, canvas){
   const scale = worldToCanvas(0, 0, canvas).scale;
-  const cellSize = GRID_CELL_M * scale;
+  const cellPx = Math.max(1, CELL_WORLD_SIZE * scale);
 
   for(const cell of state.occupancy.values()){
-    const x = cell.gx * GRID_CELL_M;
-    const y = cell.gy * GRID_CELL_M;
-
+    const x = (cell.gx + 0.5) * CELL_WORLD_SIZE;
+    const y = (cell.gy + 0.5) * CELL_WORLD_SIZE;
     const c = worldToCanvas(x, y, canvas);
-    const px = c.x - cellSize / 2;
-    const py = c.y - cellSize / 2;
 
-    const occScore = cell.occ - cell.free * 0.15;
-
-    if(occScore > 1.0){
-      const alpha = Math.min(0.9, 0.18 + occScore * 0.08);
-      ctx.fillStyle = `rgba(255, 70, 70, ${alpha})`;
-      ctx.fillRect(px, py, cellSize, cellSize);
-    } else if(cell.free > 4){
-      const alpha = Math.min(0.18, 0.03 + cell.free * 0.01);
-      ctx.fillStyle = `rgba(0, 190, 255, ${alpha})`;
-      ctx.fillRect(px, py, cellSize, cellSize);
+    if(cell.value === 1){
+      ctx.fillStyle = 'rgba(0, 200, 200, 0.7)';
+    } else if(cell.value === 2){
+      ctx.fillStyle = 'rgba(0, 120, 120, 0.95)';
+    } else if(cell.value === 3){
+      ctx.fillStyle = 'rgba(220, 40, 40, 0.95)';
+    } else {
+      continue;
     }
+
+    ctx.fillRect(c.x - cellPx / 2, c.y - cellPx / 2, cellPx, cellPx);
   }
 }
 
@@ -340,6 +338,7 @@ function drawMap(){
   const canvas = qs('#mapCanvas');
   resizeCanvas(canvas);
   const ctx = canvas.getContext('2d');
+
   drawGrid(ctx, canvas);
   drawOccupancy(ctx, canvas);
 
@@ -365,35 +364,42 @@ function drawMap(){
   }
 
   const pose = state.status.pose;
-  const r = worldToCanvas(pose.x, pose.y, canvas);
-  const robotPx = Math.max(10, r.scale * 0.11);
-  const angCanvas = (-pose.angle_deg) * Math.PI / 180.0;
+  const robot = worldToCanvas(pose.x, pose.y, canvas);
+  const angle = pose.angle_deg * Math.PI / 180.0;
+  const robotW = Math.max(10, 0.08 * robot.scale);
+  const robotH = Math.max(14, 0.12 * robot.scale);
 
-  if(state.status.distance_m != null){
-    const rayLen = Math.min(state.status.distance_m, 1.0) * r.scale;
-    ctx.save();
-    ctx.translate(r.x, r.y);
-    ctx.rotate(angCanvas);
-    ctx.strokeStyle = 'rgba(255,127,80,0.85)';
-    ctx.lineWidth = 3;
+  const beamEnd = worldToCanvas(
+    pose.x + Math.sin(angle) * state.currentEchoRange,
+    pose.y + Math.cos(angle) * state.currentEchoRange,
+    canvas
+  );
+
+  ctx.strokeStyle = 'rgba(200, 180, 0, 0.95)';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(robot.x, robot.y);
+  ctx.lineTo(beamEnd.x, beamEnd.y);
+  ctx.stroke();
+
+  if(state.currentEchoRange < MAX_SENSOR_RANGE - RADAR_EPSILON){
+    ctx.fillStyle = 'rgba(220, 40, 40, 0.95)';
     ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.lineTo(0, -rayLen);
-    ctx.stroke();
-    ctx.restore();
+    ctx.arc(beamEnd.x, beamEnd.y, 5, 0, Math.PI * 2);
+    ctx.fill();
   }
 
   ctx.save();
-  ctx.translate(r.x, r.y);
-  ctx.rotate(angCanvas);
-  ctx.fillStyle = '#101010';
-  ctx.fillRect(-robotPx * 0.9, -robotPx * 0.7, robotPx * 1.8, robotPx * 1.4);
+  ctx.translate(robot.x, robot.y);
+  ctx.rotate(angle);
+  ctx.fillStyle = '#111';
+  ctx.fillRect(-robotW / 2, -robotH / 2, robotW, robotH);
 
-  ctx.strokeStyle = '#ffcc00';
+  ctx.strokeStyle = '#ffd500';
   ctx.lineWidth = 3;
   ctx.beginPath();
   ctx.moveTo(0, 0);
-  ctx.lineTo(0, -robotPx * 1.6);
+  ctx.lineTo(0, -robotH / 2 - 18);
   ctx.stroke();
   ctx.restore();
 }
@@ -402,37 +408,67 @@ function drawRobotView(){
   const canvas = qs('#robotView');
   resizeCanvas(canvas);
   const ctx = canvas.getContext('2d');
-  const w = canvas.width, h = canvas.height;
 
-  ctx.clearRect(0,0,w,h);
-
-  const grad = ctx.createLinearGradient(0,0,0,h);
-  grad.addColorStop(0,'#081739');
-  grad.addColorStop(1,'#0c2450');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0,0,w,h);
-
-  ctx.fillStyle = '#15356a';
-  ctx.fillRect(0, h * 0.55, w, h * 0.45);
-
-  const dist = state.status.distance_m == null ? 0.8 : Math.max(0.08, state.status.distance_m);
-  const barW = Math.max(30, 220 / dist);
-  const barH = Math.max(40, 240 / dist);
-  const x = (w - barW) / 2;
-  const y = h * 0.56 - barH / 2;
-
-  ctx.fillStyle = 'rgba(255,207,84,.80)';
-  ctx.fillRect(x, y, barW, barH);
-  ctx.strokeStyle = '#ffe08a';
-  ctx.lineWidth = 3;
-  ctx.strokeRect(x, y, barW, barH);
-
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = '#ffffff';
-  ctx.font = '20px Arial';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const barWidth = canvas.width / FPS_BAR_COUNT;
+  const normalized = clamp(1.0 - state.currentEchoRange, 0, 1); // fidèle au index.js
+
+  for(let i = 0; i < FPS_BAR_COUNT; i++){
+    const value = Math.max(0.1, normalized * (1 - Math.abs(i - 5) * 0.08));
+    const h = value * canvas.height * 0.9;
+
+    ctx.fillStyle = 'rgba(255, 120, 120, 0.9)';
+    ctx.fillRect(
+      i * barWidth + 4,
+      (canvas.height - h) / 2,
+      Math.max(6, barWidth - 8),
+      h
+    );
+  }
+
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0, 0, canvas.width, canvas.height);
+
+  ctx.fillStyle = '#000';
+  ctx.font = '18px Arial';
   ctx.fillText(
     `Distance: ${state.status.distance_m == null ? '--' : state.status.distance_m.toFixed(2) + ' m'}`,
-    20, 36
+    14,
+    28
   );
+}
+
+function renderStatus(){
+  const s = state.status;
+  const robotCls = s.robot_available ? 'online' : 'offline';
+  const robotTxt = s.robot_available ? 'ok' : '--';
+  const sensorTxt = s.sensor_available ? 'ok' : '--';
+  const dist = s.distance_m == null ? '--' : `${s.distance_m.toFixed(3)} m`;
+  const occCount = Array.from(state.occupancy.values()).filter(c => c.value === 3).length;
+  const err = s.last_error ? `<div style="color:#cc241d;font-weight:700">Erreur : ${s.last_error}</div>` : '';
+
+  qs('#statusText').innerHTML = `
+    <div>Socket : <span class="online">connectée</span></div>
+    <div>Robot : <span class="${robotCls}">${robotTxt}</span></div>
+    <div>Capteur : ${sensorTxt}</div>
+    <div>Mode : ${s.mode}</div>
+    <div>X : ${s.pose.x.toFixed(2)} m</div>
+    <div>Y : ${s.pose.y.toFixed(2)} m</div>
+    <div>Angle : ${s.pose.angle_deg.toFixed(1)} °</div>
+    <div>Distance : ${dist}</div>
+    <div>Cases obstacle : ${occCount}</div>
+    ${err}
+  `;
+}
+
+function redrawAll(){
+  renderStatus();
+  drawMap();
+  drawRobotView();
 }
 
 function emitCommand(cmd){
@@ -467,35 +503,30 @@ function bindHoldButton(button, cmd){
     e.preventDefault();
     emitCommand('stop');
   });
-  button.addEventListener('pointerleave', () => {
-    emitCommand('stop');
-  });
+  button.addEventListener('pointerleave', () => emitCommand('stop'));
   button.addEventListener('contextmenu', e => e.preventDefault());
 }
 
 function bind(){
-  qs('#btnInit').onclick = () => {
-    socket.emit('initGPIO');
-  };
+  qs('#btnInit').onclick = () => socket.emit('initGPIO');
 
   qs('#btnReset').onclick = () => {
     state.trace = [];
-    state.occupancy = new Map();
     state.lastTracePoint = null;
+    state.destination = null;
+    state.occupancy = new Map();
     state.currentCommand = 'stop';
     socket.emit('resetPose');
     addLog('Pose reset + radar effacé');
+    redrawAll();
   };
 
   qs('#btnStop').onclick = () => emitCommand('stop');
 
   document.querySelectorAll('[data-cmd]').forEach(btn => {
     const cmd = btn.dataset.cmd;
-    if(cmd === 'stop'){
-      btn.onclick = () => emitCommand('stop');
-    } else {
-      bindHoldButton(btn, cmd);
-    }
+    if(cmd === 'stop') btn.onclick = () => emitCommand('stop');
+    else bindHoldButton(btn, cmd);
   });
 
   window.addEventListener('keydown', e => {
@@ -535,19 +566,11 @@ function bind(){
     drawMap();
   });
 
-  window.addEventListener('resize', () => {
-    drawMap();
-    drawRobotView();
-  });
+  window.addEventListener('resize', redrawAll);
 }
 
-socket.on('connect', () => {
-  addLog('Socket connecté');
-});
-
-socket.on('robotStatus', msg => {
-  addLog(msg.message || 'Robot initialisé');
-});
+socket.on('connect', () => addLog('Socket connecté'));
+socket.on('robotStatus', msg => addLog(msg.message || 'Robot initialisé'));
 
 socket.on('robotPoseUpdate', data => {
   state.status.robot_available = !!data.robot_available;
@@ -556,28 +579,24 @@ socket.on('robotPoseUpdate', data => {
   state.status.pose = {
     x: Number(data.x || 0),
     y: Number(data.y || 0),
-    angle_deg: Number(data.angle_deg || 0),
+    angle_deg: Number(data.angle_deg ?? ((data.angle || 0) * 180 / Math.PI)),
   };
   state.status.last_error = data.last_error || null;
 
   maybeAppendTracePoint(state.status.pose.x, state.status.pose.y);
-  renderStatus();
-  drawMap();
-  drawRobotView();
+  redrawAll();
 });
 
 socket.on('echoRangeUpdate', data => {
-  state.status.distance_m = Number(data.range ?? 1.0);
+  const range = Number(data?.range ?? MAX_SENSOR_RANGE);
+  state.currentEchoRange = clamp(range, 0.0, MAX_SENSOR_RANGE);
+  state.status.distance_m = state.currentEchoRange;
   markRadarObservation();
-  renderStatus();
-  drawMap();
-  drawRobotView();
+  redrawAll();
 });
 
 bind();
-renderStatus();
-drawMap();
-drawRobotView();
+redrawAll();
 </script>
 </body>
 </html>
