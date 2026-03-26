@@ -1,0 +1,674 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Exploro-bot — simulateur démo</title>
+<style>
+:root{--bg:#eef3f8;--card:#fff;--line:#d7e0ea;--text:#10284a;--muted:#61738e;--blue:#2f63e4;--green:#1a9b4d;--purple:#7a43e8;--danger:#d94136}
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text)}
+.layout{display:grid;grid-template-columns:360px 1fr;gap:16px;padding:16px;min-height:100vh}
+.card{background:var(--card);border:1px solid var(--line);border-radius:22px;box-shadow:0 8px 20px rgba(18,35,61,.06);padding:16px}
+h1,h2{margin:0 0 12px 0}
+.controls,.algo-row{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}
+button{font-size:16px;border:1px solid #cad5e3;background:#fff;border-radius:14px;padding:11px 15px;cursor:pointer}
+button.primary{background:var(--blue);color:#fff;border-color:var(--blue)}
+button.success{background:var(--green);color:#fff;border-color:var(--green)}
+button.purple{background:var(--purple);color:#fff;border-color:var(--purple)}
+button.active{outline:3px solid rgba(47,99,228,.2)}
+.small{font-size:14px;color:var(--muted);line-height:1.5}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+canvas{width:100%;border:1px solid var(--line);border-radius:18px;background:#fff}
+#truthCanvas,#simCanvas{height:640px}
+.table{width:100%;border-collapse:collapse;font-size:15px}
+.table th,.table td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left}
+.badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#eef4ff;color:#2755c7;font-weight:700;font-size:13px}
+.legend{display:flex;flex-wrap:wrap;gap:12px;color:var(--muted);font-size:14px;margin-top:8px}
+.dot{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:6px;vertical-align:-1px}
+.logs{background:#f7fbff;border:1px solid var(--line);border-radius:16px;padding:10px;min-height:120px;white-space:pre-wrap}
+@media (max-width:1200px){.layout{grid-template-columns:1fr}.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <section class="card">
+      <h1>Simulateur de démo</h1>
+      <div class="small">Ce simulateur est indépendant du robot réel. Il génère une carte avec obstacles, fait explorer <b>Random</b>, <b>BFS</b> et <b>DFS</b> avec un capteur type radar, puis compare le nombre d'étapes, le temps de calcul et la couverture obtenue.</div>
+      <div class="controls">
+        <button id="btnGenerate">Nouvelle carte</button>
+        <button id="btnRunAll" class="primary">Lancer les 3</button>
+        <button id="btnPlay">Lire l'animation</button>
+        <button id="btnPause">Pause</button>
+      </div>
+      <div class="algo-row">
+        <button data-algo="random" class="success active">Random</button>
+        <button data-algo="bfs" class="primary">BFS</button>
+        <button data-algo="dfs" class="purple">DFS</button>
+      </div>
+      <p class="small">Le Random avance jusqu'à un obstacle puis cherche l'ouverture la plus prometteuse. BFS et DFS planifient vers des <b>frontières</b> sur une carte partielle, avec des stratégies de secours pour couvrir 100% des cases libres atteignables.</p>
+    </section>
+
+    <section class="card">
+      <h2>Résultats</h2>
+      <table class="table">
+        <thead><tr><th>Algo</th><th>Étapes</th><th>Temps calcul</th><th>Couverture</th><th>Fin</th></tr></thead>
+        <tbody id="resultsBody"></tbody>
+      </table>
+      <div class="small" id="summaryText">Aucune simulation lancée.</div>
+    </section>
+
+    <section class="card">
+      <h2>État courant</h2>
+      <div id="statusBox" class="small"></div>
+      <div class="legend">
+        <span><i class="dot" style="background:#111"></i>robot</span>
+        <span><i class="dot" style="background:#d94136"></i>obstacle vrai</span>
+        <span><i class="dot" style="background:#14b86a"></i>libre découvert</span>
+        <span><i class="dot" style="background:#b9c5d6"></i>inconnu</span>
+        <span><i class="dot" style="background:#ffb100"></i>frontière</span>
+        <span><i class="dot" style="background:#12b3ff"></i>trace</span>
+      </div>
+      <div class="logs" id="logBox"></div>
+    </section>
+  </aside>
+
+  <main class="grid">
+    <section class="card">
+      <h2>Carte réelle</h2>
+      <canvas id="truthCanvas"></canvas>
+    </section>
+    <section class="card">
+      <h2>Carte découverte / animation <span id="algoBadge" class="badge">RANDOM</span></h2>
+      <canvas id="simCanvas"></canvas>
+    </section>
+  </main>
+</div>
+<script>
+const W = 34, H = 24, SENSOR_RANGE = 6, MAX_STEPS = 10000, TARGET_COVERAGE = 1.0;
+const DIRS = [[0,-1],[1,0],[0,1],[-1,0]]; // 0 up, 1 right, 2 down, 3 left
+const state = {
+  map: null,
+  reachableFree: 1,
+  results: {},
+  selectedAlgo: 'random',
+  playing: false,
+  frameIndex: 0,
+  logs: [],
+};
+
+function qs(s){ return document.querySelector(s); }
+function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+function shuffle(arr){ for(let i=arr.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [arr[i],arr[j]]=[arr[j],arr[i]]; } return arr; }
+function key(x,y){ return `${x}:${y}`; }
+function inBounds(x,y){ return x>=0 && y>=0 && x<W && y<H; }
+function deepCopyGrid(grid){ return grid.map(row => row.slice()); }
+
+function addLog(msg){
+  const d = new Date();
+  const t = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+  state.logs.push(`[${t}] ${msg}`);
+  state.logs = state.logs.slice(-20);
+  qs('#logBox').textContent = state.logs.join('\n');
+}
+
+function resizeCanvas(canvas){
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(rect.width * dpr), h = Math.round(rect.height * dpr);
+  if(canvas.width !== w || canvas.height !== h){ canvas.width = w; canvas.height = h; }
+}
+
+function generateMap(){
+  const grid = Array.from({length:H}, (_,y) => Array.from({length:W}, (_,x) => (x===0||y===0||x===W-1||y===H-1) ? 1 : 0));
+  const start = { x: Math.floor(W/2), y: Math.floor(H/2), dir: 0 };
+
+  for(let i=0;i<12;i++){
+    const rw = 2 + Math.floor(Math.random()*6);
+    const rh = 2 + Math.floor(Math.random()*5);
+    const rx = 1 + Math.floor(Math.random()*(W-rw-2));
+    const ry = 1 + Math.floor(Math.random()*(H-rh-2));
+    for(let y=ry;y<ry+rh;y++){
+      for(let x=rx;x<rx+rw;x++){
+        if(Math.abs(x-start.x)<=2 && Math.abs(y-start.y)<=2) continue;
+        grid[y][x] = 1;
+      }
+    }
+  }
+
+  // add corridors / holes
+  for(let i=0;i<18;i++){
+    const x = 1 + Math.floor(Math.random()*(W-2));
+    const y = 1 + Math.floor(Math.random()*(H-2));
+    if(Math.abs(x-start.x)<=2 && Math.abs(y-start.y)<=2) continue;
+    grid[y][x] = 0;
+  }
+
+  // ensure start neighborhood free
+  for(let y=start.y-1;y<=start.y+1;y++) for(let x=start.x-1;x<=start.x+1;x++) if(inBounds(x,y)) grid[y][x]=0;
+
+  state.map = { grid, start };
+  state.reachableFree = countReachableFree(grid, start);
+  state.results = {};
+  state.frameIndex = 0;
+  addLog('Nouvelle carte générée');
+  renderResults();
+  renderAll();
+}
+
+function countReachableFree(grid, start){
+  const q = [[start.x,start.y]];
+  const seen = new Set([key(start.x,start.y)]);
+  let count = 0;
+  while(q.length){
+    const [x,y] = q.shift();
+    count++;
+    for(const [dx,dy] of DIRS){
+      const nx=x+dx, ny=y+dy;
+      const k = key(nx,ny);
+      if(!inBounds(nx,ny) || seen.has(k) || grid[ny][nx]===1) continue;
+      seen.add(k); q.push([nx,ny]);
+    }
+  }
+  return count;
+}
+
+function createAgent(){
+  const {start} = state.map;
+  return {
+    x: start.x,
+    y: start.y,
+    dir: start.dir,
+    discovered: Array.from({length:H}, () => Array.from({length:W}, () => -1)), // -1 unknown, 0 free, 1 occ
+    trace: [{x:start.x,y:start.y}],
+    steps: 0,
+    blockedCount: 0,
+    wallFollowSide: 'left',
+    wallFollowTicks: 0,
+    currentPath: [],
+    currentTarget: null,
+    status: 'start',
+    stallCount: 0,
+    bestCoverage: 0,
+  };
+}
+
+function observe(agent){
+  agent.discovered[agent.y][agent.x] = 0;
+  for(let dy=-1; dy<=1; dy++) for(let dx=-1; dx<=1; dx++){
+    const nx = agent.x + dx, ny = agent.y + dy;
+    if(inBounds(nx, ny) && state.map.grid[ny][nx] === 0) agent.discovered[ny][nx] = 0;
+  }
+  const rays = 96;
+  for(let i=0;i<rays;i++){
+    const ang = (Math.PI*2*i)/rays;
+    for(let r=0.25;r<=SENSOR_RANGE;r+=0.20){
+      const x = Math.round(agent.x + Math.sin(ang)*r);
+      const y = Math.round(agent.y - Math.cos(ang)*r);
+      if(!inBounds(x,y)) break;
+      if(state.map.grid[y][x] === 1){ agent.discovered[y][x] = 1; break; }
+      agent.discovered[y][x] = 0;
+    }
+  }
+}
+
+function coverage(agent){
+  let knownFree = 0;
+  for(let y=0;y<H;y++) for(let x=0;x<W;x++) if(agent.discovered[y][x] === 0 && state.map.grid[y][x]===0) knownFree++;
+  return knownFree / Math.max(1, state.reachableFree);
+}
+
+function frontierCells(agent){
+  const out = [];
+  for(let y=1;y<H-1;y++){
+    for(let x=1;x<W-1;x++){
+      if(agent.discovered[y][x] !== 0) continue;
+      let unknownNeighbor = false;
+      for(const [dx,dy] of DIRS){
+        const nx=x+dx, ny=y+dy;
+        if(inBounds(nx,ny) && agent.discovered[ny][nx] === -1){ unknownNeighbor = true; break; }
+      }
+      if(unknownNeighbor) out.push({x,y});
+    }
+  }
+  return out;
+}
+
+function orderedNeighborsByHeading(agent, x, y){
+  const order = [agent.dir, (agent.dir+1)%4, (agent.dir+3)%4, (agent.dir+2)%4];
+  return order.map(i => ({ x:x+DIRS[i][0], y:y+DIRS[i][1], dir:i }));
+}
+
+function planFrontierPath(agent, strategy){
+  const start = {x:agent.x, y:agent.y};
+  const startKey = key(start.x,start.y);
+  const parent = new Map([[startKey, null]]);
+  const fringe = [start];
+  const pop = strategy === 'bfs' ? () => fringe.shift() : () => fringe.pop();
+  while(fringe.length){
+    const cell = pop();
+    if(!(cell.x === start.x && cell.y === start.y) && isFrontier(agent, cell.x, cell.y)){
+      return reconstructPath(parent, cell);
+    }
+    const nbs = orderedNeighborsByHeading(agent, cell.x, cell.y);
+    if(strategy === 'dfs') nbs.reverse();
+    for(const n of nbs){
+      const k = key(n.x,n.y);
+      if(!inBounds(n.x,n.y) || parent.has(k) || agent.discovered[n.y][n.x] !== 0) continue;
+      parent.set(k, cell);
+      fringe.push({x:n.x,y:n.y});
+    }
+  }
+  return [];
+}
+
+function isFrontier(agent,x,y){
+  if(agent.discovered[y][x] !== 0) return false;
+  for(const [dx,dy] of DIRS){
+    const nx=x+dx, ny=y+dy;
+    if(inBounds(nx,ny) && agent.discovered[ny][nx] === -1) return true;
+  }
+  return false;
+}
+
+function reconstructPath(parent, end){
+  const path = [end];
+  let cur = end;
+  while(cur){
+    cur = parent.get(key(cur.x, cur.y));
+    if(cur) path.push(cur);
+  }
+  return path.reverse();
+}
+
+function rotateToward(agent, next){
+  for(let i=0;i<4;i++){
+    const [dx,dy] = DIRS[i];
+    if(agent.x + dx === next.x && agent.y + dy === next.y){ agent.dir = i; return; }
+  }
+}
+
+function forwardCell(agent){
+  const [dx,dy] = DIRS[agent.dir];
+  return { x: agent.x + dx, y: agent.y + dy };
+}
+
+function distanceUntilBlockedFrom(agent, dir){
+  let d = 0;
+  let x = agent.x, y = agent.y;
+  const [dx,dy] = DIRS[dir];
+  while(d < SENSOR_RANGE){
+    x += dx; y += dy; d++;
+    if(!inBounds(x,y) || state.map.grid[y][x] === 1) return d-1;
+  }
+  return d;
+}
+
+function directionalUnknownScore(agent, dir){
+  const [dx,dy] = DIRS[dir];
+  let x = agent.x, y = agent.y;
+  let score = 0;
+  for(let d=1; d<=SENSOR_RANGE; d++){
+    x += dx; y += dy;
+    if(!inBounds(x,y)) break;
+    if(state.map.grid[y][x] === 1){ score -= 0.15; break; }
+    if(agent.discovered[y][x] === -1) score += 0.26;
+    for(const [sx,sy] of DIRS){
+      const nx=x+sx, ny=y+sy;
+      if(inBounds(nx,ny) && agent.discovered[ny][nx] === -1) score += 0.05;
+    }
+  }
+  return score;
+}
+
+function scoreDirection(agent, dir){
+  const dist = distanceUntilBlockedFrom(agent, dir);
+  let score = dist * 1.45 + directionalUnknownScore(agent, dir);
+  if(dir === agent.dir) score += 0.18;
+  return { dir, dist, score };
+}
+
+function bestDirection(agent){
+  const dirs = [agent.dir, (agent.dir+3)%4, (agent.dir+1)%4, (agent.dir+2)%4];
+  return dirs.map(dir => scoreDirection(agent, dir)).sort((a,b)=>b.score-a.score)[0];
+}
+
+function turn(agent, delta){ agent.dir = (agent.dir + delta + 4) % 4; }
+
+function moveForward(agent){
+  const f = forwardCell(agent);
+  if(inBounds(f.x,f.y) && state.map.grid[f.y][f.x] === 0){
+    agent.x = f.x; agent.y = f.y;
+    agent.trace.push({x:agent.x,y:agent.y});
+    return true;
+  }
+  return false;
+}
+
+function stepRandom(agent){
+  observe(agent);
+  const front = distanceUntilBlockedFrom(agent, agent.dir);
+  const aheadUnknown = directionalUnknownScore(agent, agent.dir);
+  if(front >= 1 && (aheadUnknown > 0.12 || Math.random() < 0.86)){
+    if(moveForward(agent)){
+      agent.status = 'avance';
+      agent.blockedCount = 0;
+      return;
+    }
+  }
+
+  const best = bestDirection(agent);
+  if(best && best.dist >= 1 && best.score > 0.9){
+    agent.dir = best.dir;
+    if(moveForward(agent)){
+      agent.status = 'choisit ouverture';
+      agent.blockedCount = 0;
+      return;
+    }
+    agent.status = 'tourne vers ouverture';
+    return;
+  }
+
+  agent.blockedCount += 1;
+  if(agent.blockedCount >= 3){
+    agent.wallFollowTicks = 14;
+    agent.wallFollowSide = Math.random() < 0.5 ? 'left' : 'right';
+    agent.status = 'wall-follow';
+    stepWallFollow(agent);
+    return;
+  }
+
+  turn(agent, 1);
+  agent.status = 'tourne';
+}
+
+function stepWallFollow(agent){
+  const sideDir = agent.wallFollowSide === 'left' ? (agent.dir + 3) % 4 : (agent.dir + 1) % 4;
+  const front = distanceUntilBlockedFrom(agent, agent.dir);
+  const side = distanceUntilBlockedFrom(agent, sideDir);
+  if(front < 1){
+    turn(agent, agent.wallFollowSide === 'left' ? 1 : -1);
+    agent.status = 'wall-follow tourne';
+  } else if(side > 1){
+    turn(agent, agent.wallFollowSide === 'left' ? -1 : 1);
+    moveForward(agent);
+    agent.status = 'wall-follow raccroche';
+  } else {
+    moveForward(agent);
+    agent.status = 'wall-follow avance';
+  }
+  agent.wallFollowTicks -= 1;
+  if(agent.wallFollowTicks <= 0) agent.blockedCount = 0;
+}
+
+function stepFrontier(agent, strategy){
+  observe(agent);
+  if(agent.wallFollowTicks > 0){ stepWallFollow(agent); return; }
+
+  if(!agent.currentPath.length || !agent.currentTarget || (agent.x === agent.currentTarget.x && agent.y === agent.currentTarget.y)){
+    agent.currentPath = planFrontierPath(agent, strategy);
+    agent.currentTarget = agent.currentPath.length ? agent.currentPath[agent.currentPath.length - 1] : null;
+    if(agent.currentPath.length <= 1){
+      const best = bestDirection(agent);
+      agent.blockedCount += 1;
+      if(best && best.dist >= 1 && best.score > 0.95){
+        agent.dir = best.dir;
+        if(moveForward(agent)){
+          agent.currentPath = [];
+          agent.currentTarget = null;
+          agent.blockedCount = 0;
+          agent.status = 'relocalise';
+          return;
+        }
+      }
+      if(agent.blockedCount >= 3){
+        agent.wallFollowTicks = 14;
+        agent.wallFollowSide = strategy === 'bfs' ? 'left' : 'right';
+        agent.status = 'pas de frontière -> wall-follow';
+        stepWallFollow(agent);
+      } else {
+        turn(agent, strategy === 'bfs' ? 1 : -1);
+        agent.status = 're-scan';
+      }
+      return;
+    }
+  }
+
+  const next = agent.currentPath[1];
+  rotateToward(agent, next);
+  if(moveForward(agent)){
+    agent.currentPath.shift();
+    agent.blockedCount = 0;
+    agent.status = `va vers frontière (${strategy})`;
+    return;
+  }
+
+  agent.currentPath = [];
+  agent.currentTarget = null;
+  agent.blockedCount += 1;
+  if(agent.blockedCount >= 2){
+    agent.wallFollowTicks = 10;
+    agent.wallFollowSide = strategy === 'bfs' ? 'left' : 'right';
+    agent.status = 'bloqué -> wall-follow';
+    stepWallFollow(agent);
+  } else {
+    const best = bestDirection(agent);
+    if(best && best.dist >= 1){
+      agent.dir = best.dir;
+      agent.status = 'change de couloir';
+    } else {
+      turn(agent, strategy === 'bfs' ? 1 : -1);
+      agent.status = 'tourne';
+    }
+  }
+}
+
+function simulateAlgorithm(name){
+  const agent = createAgent();
+  observe(agent);
+  const history = [snapshot(agent)];
+  const t0 = performance.now();
+  for(let step=0; step<MAX_STEPS; step++){
+    agent.steps++;
+    if(name === 'random'){
+      if(agent.wallFollowTicks > 0) stepWallFollow(agent); else stepRandom(agent);
+    } else if(name === 'bfs'){
+      stepFrontier(agent, 'bfs');
+    } else {
+      stepFrontier(agent, 'dfs');
+    }
+    observe(agent);
+    const cov = coverage(agent);
+    if(cov > agent.bestCoverage + 1e-9){
+      agent.bestCoverage = cov;
+      agent.stallCount = 0;
+    } else {
+      agent.stallCount += 1;
+    }
+
+    if(agent.stallCount > 80){
+      const best = bestDirection(agent);
+      if(best && best.dist >= 1){
+        agent.dir = best.dir;
+        moveForward(agent);
+        observe(agent);
+      } else {
+        agent.wallFollowTicks = 18;
+        agent.wallFollowSide = name === 'dfs' ? 'right' : 'left';
+      }
+      agent.stallCount = 0;
+      agent.status = 'décollage secours';
+    }
+
+    history.push(snapshot(agent));
+    if(cov >= TARGET_COVERAGE) break;
+  }
+  const ms = performance.now() - t0;
+  return {
+    algo: name,
+    ms,
+    steps: agent.steps,
+    coverage: coverage(agent),
+    done: coverage(agent) >= TARGET_COVERAGE,
+    history,
+  };
+}
+
+function snapshot(agent){
+  return {
+    x: agent.x,
+    y: agent.y,
+    dir: agent.dir,
+    discovered: deepCopyGrid(agent.discovered),
+    trace: agent.trace.slice(),
+    status: agent.status,
+    coverage: coverage(agent),
+    frontiers: frontierCells(agent).length,
+    steps: agent.steps,
+  };
+}
+
+function runAll(){
+  if(!state.map) generateMap();
+  addLog('Simulation des 3 algorithmes...');
+  state.results.random = simulateAlgorithm('random');
+  state.results.bfs = simulateAlgorithm('bfs');
+  state.results.dfs = simulateAlgorithm('dfs');
+  renderResults();
+  state.frameIndex = 0;
+  addLog('Résultats prêts');
+  renderAll();
+}
+
+function renderResults(){
+  const body = qs('#resultsBody');
+  body.innerHTML = ['random','bfs','dfs'].map(name => {
+    const r = state.results[name];
+    if(!r) return `<tr><td>${name.toUpperCase()}</td><td>--</td><td>--</td><td>--</td><td>--</td></tr>`;
+    return `<tr><td>${name.toUpperCase()}</td><td>${r.steps}</td><td>${r.ms.toFixed(1)} ms</td><td>${(r.coverage*100).toFixed(1)}%</td><td>${r.done ? 'oui' : 'partiel'}</td></tr>`;
+  }).join('');
+  const filled = Object.values(state.results).filter(Boolean);
+  if(!filled.length){
+    qs('#summaryText').textContent = 'Aucune simulation lancée.';
+    return;
+  }
+  const best = filled.slice().sort((a,b)=>a.steps-b.steps)[0];
+  qs('#summaryText').textContent = `Sur cette carte, ${best.algo.toUpperCase()} finit en le moins d'étapes (${best.steps}). BFS est souvent plus régulier; DFS plonge plus vite dans une branche; Random est plus simple mais moins stable.`;
+}
+
+function drawCellGrid(ctx, canvas, grid, overlay){
+  resizeCanvas(canvas);
+  const cw = canvas.width / W;
+  const ch = canvas.height / H;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  for(let y=0;y<H;y++){
+    for(let x=0;x<W;x++){
+      const v = grid[y][x];
+      if(v === 1) ctx.fillStyle = '#d94136';
+      else if(v === 0) ctx.fillStyle = '#ffffff';
+      else ctx.fillStyle = '#b9c5d6';
+      ctx.fillRect(x*cw, y*ch, cw, ch);
+      ctx.strokeStyle = '#e5ebf2';
+      ctx.strokeRect(x*cw, y*ch, cw, ch);
+    }
+  }
+  if(overlay){ overlay(ctx, cw, ch); }
+}
+
+function drawTruth(){
+  if(!state.map) return;
+  drawCellGrid(qs('#truthCanvas').getContext('2d'), qs('#truthCanvas'), state.map.grid, (ctx,cw,ch) => {
+    const s = state.map.start;
+    ctx.fillStyle = '#111';
+    ctx.beginPath();
+    ctx.arc((s.x+0.5)*cw, (s.y+0.5)*ch, Math.min(cw,ch)*0.35, 0, Math.PI*2);
+    ctx.fill();
+  });
+}
+
+function drawSim(){
+  const result = state.results[state.selectedAlgo];
+  const canvas = qs('#simCanvas');
+  if(!result){ resizeCanvas(canvas); const ctx=canvas.getContext('2d'); ctx.clearRect(0,0,canvas.width,canvas.height); return; }
+  const snap = result.history[Math.min(state.frameIndex, result.history.length-1)];
+  drawCellGrid(canvas.getContext('2d'), canvas, snap.discovered, (ctx,cw,ch) => {
+    // frontiers
+    for(let y=1;y<H-1;y++){
+      for(let x=1;x<W-1;x++){
+        if(snap.discovered[y][x] !== 0) continue;
+        let frontier = false;
+        for(const [dx,dy] of DIRS){ if(inBounds(x+dx,y+dy) && snap.discovered[y+dy][x+dx] === -1){ frontier = true; break; } }
+        if(frontier){
+          ctx.fillStyle = 'rgba(255,177,0,.35)';
+          ctx.fillRect(x*cw, y*ch, cw, ch);
+        }
+      }
+    }
+    if(snap.trace.length > 1){
+      ctx.strokeStyle = '#12b3ff'; ctx.lineWidth = Math.max(1.5, Math.min(cw,ch)*0.15);
+      ctx.beginPath();
+      snap.trace.forEach((p,i)=>{ const px=(p.x+0.5)*cw, py=(p.y+0.5)*ch; if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py); });
+      ctx.stroke();
+    }
+    ctx.fillStyle = '#111';
+    ctx.beginPath();
+    ctx.arc((snap.x+0.5)*cw, (snap.y+0.5)*ch, Math.min(cw,ch)*0.32, 0, Math.PI*2);
+    ctx.fill();
+    const [dx,dy] = DIRS[snap.dir];
+    ctx.strokeStyle = '#ffd400'; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo((snap.x+0.5)*cw, (snap.y+0.5)*ch);
+    ctx.lineTo((snap.x+0.5+dx*0.48)*cw, (snap.y+0.5+dy*0.48)*ch);
+    ctx.stroke();
+  });
+
+  qs('#algoBadge').textContent = state.selectedAlgo.toUpperCase();
+  qs('#statusBox').innerHTML = `<div>Algo : <b>${state.selectedAlgo.toUpperCase()}</b></div>
+    <div>Frame : ${Math.min(state.frameIndex, result.history.length-1)+1} / ${result.history.length}</div>
+    <div>Étapes : ${snap.steps}</div>
+    <div>Couverture : ${(snap.coverage*100).toFixed(1)}%</div>
+    <div>Frontières visibles : ${snap.frontiers}</div>
+    <div>État : ${snap.status}</div>`;
+}
+
+function renderAll(){ drawTruth(); drawSim(); }
+
+function animationLoop(){
+  if(state.playing){
+    const result = state.results[state.selectedAlgo];
+    if(result){
+      state.frameIndex = Math.min(state.frameIndex + 1, result.history.length - 1);
+      if(state.frameIndex >= result.history.length - 1) state.playing = false;
+      drawSim();
+    }
+  }
+  requestAnimationFrame(animationLoop);
+}
+
+function bind(){
+  qs('#btnGenerate').onclick = () => generateMap();
+  qs('#btnRunAll').onclick = () => runAll();
+  qs('#btnPlay').onclick = () => { state.playing = true; addLog(`Lecture ${state.selectedAlgo.toUpperCase()}`); };
+  qs('#btnPause').onclick = () => { state.playing = false; };
+  document.querySelectorAll('[data-algo]').forEach(btn => {
+    btn.onclick = () => {
+      document.querySelectorAll('[data-algo]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      state.selectedAlgo = btn.dataset.algo;
+      state.frameIndex = 0;
+      renderAll();
+    };
+  });
+  window.addEventListener('resize', renderAll);
+}
+
+bind();
+generateMap();
+runAll();
+animationLoop();
+</script>
+</body>
+</html>

@@ -3,32 +3,35 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Exploro Bot Frontend</title>
+<title>Exploro Bot Frontend Exploration v8</title>
 <style>
 :root{
   --bg:#eef2f7; --card:#ffffff; --line:#d8e0eb; --text:#0f2748; --muted:#5b6f8b;
-  --blue:#3164e0; --danger:#e33b30; --robot:#101010; --trace:#00d9ff; --dest:#ffb300;
-  --obs:#ff5f5f; --scan:#c8b400; --free:#00b7c7;
+  --blue:#3164e0; --green:#118c35; --danger:#e33b30; --robot:#101010; --trace:#00d9ff;
+  --target:#ffb300; --waypoint:#8a4dff; --obs:#ff5f5f; --free:#00b7c7;
 }
 *{box-sizing:border-box}
 body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text)}
-.layout{display:grid;grid-template-columns:360px 1fr 380px;gap:16px;padding:16px;min-height:100vh}
+.layout{display:grid;grid-template-columns:390px 1fr 400px;gap:16px;padding:16px;min-height:100vh}
 .card{background:#fff;border:1px solid var(--line);border-radius:22px;box-shadow:0 8px 20px rgba(18,35,61,.06);padding:16px;margin-bottom:16px}
 h2{margin:0 0 14px 0;font-size:24px}
-.status-grid{display:grid;gap:6px;font-size:18px;line-height:1.35}
+.status-grid{display:grid;gap:6px;font-size:17px;line-height:1.35}
 .online{color:#118c35;font-weight:700}
 .offline{color:#cc241d;font-weight:700}
-.btn-row,.cmd-grid{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
-button{font-size:18px;border:1px solid #c8d3e0;background:#fff;border-radius:14px;padding:12px 16px;cursor:pointer}
+.btn-row,.cmd-grid,.algo-grid{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
+button{font-size:17px;border:1px solid #c8d3e0;background:#fff;border-radius:14px;padding:12px 16px;cursor:pointer}
 button.primary{background:var(--blue);color:#fff;border-color:var(--blue)}
+button.success{background:var(--green);color:#fff;border-color:var(--green)}
 button.danger{color:var(--danger)}
-.logs pre{margin:0;background:#f8fbff;border:1px solid var(--line);border-radius:16px;padding:12px;min-height:220px;max-height:320px;overflow:auto;white-space:pre-wrap;font-size:15px}
+button.active{outline:3px solid rgba(49,100,224,.20)}
+.logs pre{margin:0;background:#f8fbff;border:1px solid var(--line);border-radius:16px;padding:12px;min-height:220px;max-height:320px;overflow:auto;white-space:pre-wrap;font-size:14px}
 .canvas-card{height:calc(100vh - 32px);display:flex;flex-direction:column}
 .canvas-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}
 .legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:14px}
 .dot{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:6px;vertical-align:-1px}
 .dot.robot{background:var(--robot)}
-.dot.dest{background:var(--dest)}
+.dot.target{background:var(--target)}
+.dot.waypoint{background:var(--waypoint)}
 .dot.obs{background:var(--obs)}
 .dot.trace{background:var(--trace)}
 .dot.free{background:var(--free)}
@@ -37,7 +40,20 @@ button.danger{color:var(--danger)}
 #robotView{background:#071638;height:500px}
 .help{color:var(--muted);font-size:15px}
 .small{font-size:14px;color:var(--muted);margin-top:8px}
-@media (max-width:1180px){
+.kpi-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.kpi{background:#f7faff;border:1px solid var(--line);border-radius:16px;padding:10px 12px}
+.kpi strong{display:block;font-size:24px;margin-top:2px}
+.badge{display:inline-block;padding:4px 8px;border-radius:999px;font-size:13px;font-weight:700;background:#eef4ff;color:#214fb8}
+.badge.idle{background:#f0f2f5;color:#5a677a}
+.badge.random{background:#e7fff0;color:#15713a}
+.badge.bfs{background:#eef4ff;color:#214fb8}
+.badge.dfs{background:#f4ecff;color:#6835d6}
+.badge.blocked{background:#fff1ef;color:#cc241d}
+.param-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+.param-grid label{display:flex;flex-direction:column;gap:6px;font-size:14px;color:var(--muted)}
+.param-grid input{width:100%;font-size:16px;border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:#fff;color:var(--text)}
+.param-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}
+@media (max-width:1280px){
   .layout{grid-template-columns:1fr}
   .canvas-card{height:760px}
 }
@@ -47,18 +63,56 @@ button.danger{color:var(--danger)}
 <div class="layout">
   <aside>
     <section class="card">
-      <h2>État</h2>
+      <h2>État robot</h2>
       <div id="statusText" class="status-grid"></div>
       <div class="btn-row">
         <button id="btnInit" class="primary">Init robot</button>
-        <button id="btnReset">Reset pose</button>
-        <button id="btnStop" class="danger">STOP</button>
+        <button id="btnResetPose">Reset pose</button>
+        <button id="btnStopManual" class="danger">STOP manuel</button>
       </div>
-      <div class="small">Carte probabiliste : 0% = libre probable, 100% = mur probable.</div>
+      <div class="small">Carte locale probabiliste : 0% = libre probable, 100% = mur probable. Les 3 LineSensor sont affichés pour debug et aident aussi le backend à corriger légèrement la trajectoire, avec un secours wall-follow et une marche arrière si le robot reste coincé.</div>
     </section>
 
     <section class="card">
-      <h2>Commandes</h2>
+      <h2>Exploration</h2>
+      <div class="kpi-grid">
+        <div class="kpi">Mode<strong id="kpiMode">idle</strong></div>
+        <div class="kpi">Phase<strong id="kpiPhase">idle</strong></div>
+        <div class="kpi">Couverture<strong id="kpiCoverage">0%</strong></div>
+        <div class="kpi">Replans<strong id="kpiReplans">0</strong></div>
+        <div class="kpi">Frontières<strong id="kpiFrontiers">0</strong></div>
+      </div>
+      <div class="algo-grid">
+        <button id="btnRandom" class="success">Random</button>
+        <button id="btnBfs" class="primary">BFS</button>
+        <button id="btnDfs" class="primary">DFS</button>
+        <button id="btnStopExploration" class="danger">Stop exploration</button>
+        <button id="btnResetMap">Reset carte serveur</button>
+      </div>
+      <p class="help">Random = logique continue d’avant. BFS = exploration par couches. DFS = exploration en profondeur. Les réglages ci-dessous s’appliquent en direct sans relancer le backend.</p>
+    </section>
+
+    <section class="card">
+      <h2>Réglages en direct</h2>
+      <div class="param-grid">
+        <label>Arrêt objet (cm)<input id="cfgStopCm" type="number" min="3" max="25" step="0.5"></label>
+        <label>Ralentir avant objet (cm)<input id="cfgSlowCm" type="number" min="4" max="45" step="0.5"></label>
+        <label>Danger très proche (cm)<input id="cfgDangerCm" type="number" min="2" max="25" step="0.5"></label>
+        <label>Vitesse algo (%)<input id="cfgAlgoSpeed" type="number" min="40" max="100" step="1"></label>
+        <label>Wall-follow (s)<input id="cfgWallFollowS" type="number" min="0.6" max="8" step="0.1"></label>
+        <label>Virage évitement (s)<input id="cfgAvoidTurnS" type="number" min="0.1" max="1.8" step="0.05"></label>
+        <label>Recul secours (s)<input id="cfgBackoutS" type="number" min="0.1" max="1.8" step="0.05"></label>
+      </div>
+      <div class="param-actions">
+        <button id="btnApplyConfig" class="primary">Appliquer</button>
+        <button id="btnResetConfig">Réglages par défaut</button>
+        <button id="btnSimulation">Simulation</button>
+      </div>
+      <p class="help">Le bouton Simulation ouvre la démo dans une autre page via le backend, donc tu n’as plus besoin d’ouvrir un fichier HTML à la main.</p>
+    </section>
+
+    <section class="card">
+      <h2>Commandes manuelles</h2>
       <div class="cmd-grid">
         <button data-cmd="forward">↑ avancer</button>
         <button data-cmd="backward">↓ reculer</button>
@@ -66,7 +120,7 @@ button.danger{color:var(--danger)}
         <button data-cmd="right">→ droite</button>
         <button data-cmd="stop">stop</button>
       </div>
-      <p class="help">Flèches clavier = pilotage maintenu. Espace = stop. Clic droit = destination.</p>
+      <p class="help">Flèches clavier = pilotage maintenu. Espace = stop. Manette : stick gauche pour bouger, A stop, Start init robot, X Random, Y BFS, B DFS, LB stop exploration. En manuel, le backend sort du mode exploration.</p>
     </section>
 
     <section class="card logs">
@@ -81,7 +135,8 @@ button.danger{color:var(--danger)}
         <h2>Carte</h2>
         <div class="legend">
           <span><i class="dot robot"></i>robot</span>
-          <span><i class="dot dest"></i>destination</span>
+          <span><i class="dot target"></i>cible algo</span>
+          <span><i class="dot waypoint"></i>waypoint</span>
           <span><i class="dot free"></i>libre probable</span>
           <span><i class="dot obs"></i>mur probable</span>
           <span><i class="dot trace"></i>trace</span>
@@ -95,17 +150,24 @@ button.danger{color:var(--danger)}
     <section class="card">
       <h2>Vue robot</h2>
       <canvas id="robotView" width="360" height="500"></canvas>
-      <div class="small">Les 11 barres viennent de la carte mémorisée + de la mesure actuelle, donc les obstacles ressortent en blocs plus stables.</div>
+      <div class="small">Les 11 barres fusionnent la mesure actuelle et la carte locale mémorisée pour faire apparaître les obstacles en blocs plus stables.</div>
     </section>
   </aside>
 </div>
 
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script>
-const socket = io();
+const SOCKET_URL = window.location.protocol === 'file:' ? 'http://127.0.0.1:8765' : undefined;
+const APP_BASE_URL = SOCKET_URL || window.location.origin;
+const socket = SOCKET_URL ? io(SOCKET_URL, { transports: ['polling', 'websocket'] }) : io();
+let pendingExplorationMode = null;
+let pendingExplorationTimer = null;
 
-const CELL_WORLD_SIZE = 0.02;        // 2 cm : mieux adapté au bruit du capteur ultrason
-const MAX_SENSOR_RANGE = 0.5;        // cohérent avec le projet de référence
+const CELL_WORLD_SIZE = 0.02;
+const SERVER_CELL_SIZE = 0.10;
+const WORLD_W = 6.0;
+const WORLD_H = 6.0;
+const MAX_SENSOR_RANGE = 0.5;
 const RADAR_EPSILON = 0.02;
 const RADAR_MAX_CELLS = 25000;
 const FPS_BAR_COUNT = 11;
@@ -122,36 +184,80 @@ const LOG_ODDS_MIN = -4.6;
 const LOG_ODDS_MAX = 4.6;
 
 const state = {
-  worldW: 6,
-  worldH: 6,
+  worldW: WORLD_W,
+  worldH: WORLD_H,
   currentEchoRange: MAX_SENSOR_RANGE,
   status: {
+    connected: false,
     robot_available: false,
     sensor_available: false,
+    line_sensor_available: false,
+    line_sensors: {left:false, center:false, right:false},
     mode: 'stop',
     pose: {x: 3, y: 3, angle_deg: 0},
     distance_m: null,
     last_error: null,
   },
+  exploration: {
+    enabled: false,
+    mode: 'idle',
+    phase: 'idle',
+    coverage: 0,
+    replans: 0,
+    visited_frontiers: 0,
+    waypoint: null,
+    target: null,
+    recovery_side: null,
+  },
+  prevExploration: null,
   trace: [],
   lastTracePoint: null,
-  destination: null,
   currentCommand: 'stop',
+  manualActive: false,
   logs: [],
-  keys: {
-    ArrowUp: false,
-    ArrowDown: false,
-    ArrowLeft: false,
-    ArrowRight: false,
+  keys: { ArrowUp:false, ArrowDown:false, ArrowLeft:false, ArrowRight:false },
+  gamepad: {
+    connected: false,
+    index: null,
+    label: '',
+    buttonsPrev: [],
+    lastManualCommand: 'stop',
   },
-  occupancy: new Map(), // key => {gx, gy, logOdds, prob, touchedAt, updatedAt}
+  occupancy: new Map(),
   fpsView: new Array(FPS_BAR_COUNT).fill(0.06),
+  config: {
+    safe_front_clearance_m: 0.09,
+    slow_front_clearance_m: 0.14,
+    danger_front_clearance_m: 0.06,
+    algo_speed: 72,
+    wall_follow_duration_s: 2.8,
+    avoid_turn_base_s: 0.42,
+    backout_duration_s: 0.55,
+  },
   lastMaintenanceAt: 0,
 };
 
 function qs(sel){ return document.querySelector(sel); }
 function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
 function lerp(a, b, t){ return a + (b - a) * t; }
+function fmtPct(v){ return `${(v * 100).toFixed(1)}%`; }
+function titleCase(s){ return String(s || '').toUpperCase(); }
+
+function gamepadLabel(id){
+  if(!id) return 'gamepad';
+  return String(id).split('(')[0].trim() || 'gamepad';
+}
+function buttonPressed(gp, idx){
+  return !!(gp?.buttons?.[idx] && gp.buttons[idx].pressed);
+}
+function probabilityToColor(prob){
+  if(prob >= 50){
+    const alpha = clamp((prob - 50) / 50, 0.14, 0.95);
+    return `rgba(220, 40, 40, ${alpha})`;
+  }
+  const alpha = clamp((50 - prob) / 50, 0.10, 0.82);
+  return `rgba(0, 200, 200, ${alpha})`;
+}
 
 function logOddsToProb(logOdds){
   return 100 / (1 + Math.exp(-logOdds));
@@ -163,9 +269,9 @@ function addLog(msg){
   const mm = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
   state.logs.push(`[${hh}:${mm}:${ss}] ${msg}`);
-  state.logs = state.logs.slice(-180);
+  state.logs = state.logs.slice(-220);
   const box = qs('#logBox');
-  box.textContent = state.logs.slice(-24).join('\n');
+  box.textContent = state.logs.slice(-30).join('\n');
   box.scrollTop = box.scrollHeight;
 }
 
@@ -185,21 +291,7 @@ function worldToCanvas(x, y, canvas){
   const scale = Math.min((canvas.width - pad * 2) / state.worldW, (canvas.height - pad * 2) / state.worldH);
   const ox = (canvas.width - state.worldW * scale) / 2;
   const oy = (canvas.height - state.worldH * scale) / 2;
-  return {
-    x: ox + x * scale,
-    y: oy + (state.worldH - y) * scale,
-    scale,
-    ox,
-    oy,
-  };
-}
-
-function canvasToWorld(px, py, canvas){
-  const ref = worldToCanvas(0, 0, canvas);
-  return {
-    x: clamp((px - ref.ox) / ref.scale, 0, state.worldW),
-    y: clamp(state.worldH - ((py - ref.oy) / ref.scale), 0, state.worldH),
-  };
+  return { x: ox + x * scale, y: oy + (state.worldH - y) * scale, scale, ox, oy };
 }
 
 function maybeAppendTracePoint(x, y){
@@ -208,36 +300,23 @@ function maybeAppendTracePoint(x, y){
     state.lastTracePoint = {x, y};
     return;
   }
-
   const dist = Math.hypot(x - state.lastTracePoint.x, y - state.lastTracePoint.y);
   if(dist >= CELL_WORLD_SIZE * 0.75){
     state.trace.push({x, y});
     state.lastTracePoint = {x, y};
   }
-
-  if(state.trace.length > 4000){
-    state.trace = state.trace.slice(-4000);
+  if(state.trace.length > 5000){
+    state.trace = state.trace.slice(-5000);
   }
 }
 
-function cellKey(gx, gy){
-  return `${gx}:${gy}`;
+function cellKey(gx, gy){ return `${gx}:${gy}`; }
+function worldToGrid(x, y){ return { gx: Math.floor(x / CELL_WORLD_SIZE), gy: Math.floor(y / CELL_WORLD_SIZE) }; }
+function gridToWorldCenter(gx, gy){ return { x: (gx + 0.5) * CELL_WORLD_SIZE, y: (gy + 0.5) * CELL_WORLD_SIZE }; }
+function serverGridToWorld(cell){
+  if(!Array.isArray(cell) || cell.length < 2) return null;
+  return { x: Number(cell[0]) * SERVER_CELL_SIZE, y: Number(cell[1]) * SERVER_CELL_SIZE };
 }
-
-function worldToGrid(x, y){
-  return {
-    gx: Math.floor(x / CELL_WORLD_SIZE),
-    gy: Math.floor(y / CELL_WORLD_SIZE),
-  };
-}
-
-function gridToWorldCenter(gx, gy){
-  return {
-    x: (gx + 0.5) * CELL_WORLD_SIZE,
-    y: (gy + 0.5) * CELL_WORLD_SIZE,
-  };
-}
-
 function inGrid(gx, gy){
   return gx >= 0 && gx < Math.floor(state.worldW / CELL_WORLD_SIZE) && gy >= 0 && gy < Math.floor(state.worldH / CELL_WORLD_SIZE);
 }
@@ -247,14 +326,7 @@ function getCell(gx, gy, create = false){
   const key = cellKey(gx, gy);
   let cell = state.occupancy.get(key);
   if(!cell && create){
-    cell = {
-      gx,
-      gy,
-      logOdds: 0,
-      prob: 50,
-      touchedAt: Date.now(),
-      updatedAt: Date.now(),
-    };
+    cell = { gx, gy, logOdds: 0, prob: 50, touchedAt: Date.now(), updatedAt: Date.now() };
     state.occupancy.set(key, cell);
   }
   return cell || null;
@@ -263,13 +335,11 @@ function getCell(gx, gy, create = false){
 function updateCellEvidence(gx, gy, delta, stamp = Date.now()){
   const cell = getCell(gx, gy, true);
   if(!cell) return;
-
   const idleMs = stamp - cell.updatedAt;
   if(idleMs > 0){
     const relax = Math.exp(-idleMs / 65000);
     cell.logOdds *= relax;
   }
-
   cell.logOdds = clamp(cell.logOdds + delta, LOG_ODDS_MIN, LOG_ODDS_MAX);
   cell.prob = logOddsToProb(cell.logOdds);
   cell.touchedAt = stamp;
@@ -280,20 +350,17 @@ function maintainOccupancy(){
   const now = Date.now();
   if(now - state.lastMaintenanceAt < 900) return;
   state.lastMaintenanceAt = now;
-
   for(const [key, cell] of state.occupancy.entries()){
     const ageMs = now - cell.updatedAt;
     const relax = Math.exp(-(now - cell.touchedAt) / 110000);
     cell.logOdds *= relax;
     cell.prob = logOddsToProb(cell.logOdds);
     cell.touchedAt = now;
-
     const confidence = Math.abs(cell.prob - 50);
     if(ageMs > 120000 || (ageMs > 12000 && confidence < 4)){
       state.occupancy.delete(key);
     }
   }
-
   if(state.occupancy.size > RADAR_MAX_CELLS){
     const entries = Array.from(state.occupancy.entries()).sort((a, b) => {
       const aScore = (Math.abs(a[1].prob - 50) * 20) - (now - a[1].updatedAt) / 1000;
@@ -309,17 +376,14 @@ function stampObstacleBlob(centerX, centerY, radiusM, baseDelta){
   const radius = Math.max(CELL_WORLD_SIZE * 1.5, radiusM);
   const rCells = Math.ceil(radius / CELL_WORLD_SIZE);
   const centerGrid = worldToGrid(centerX, centerY);
-
   for(let dx = -rCells; dx <= rCells; dx++){
     for(let dy = -rCells; dy <= rCells; dy++){
       const gx = centerGrid.gx + dx;
       const gy = centerGrid.gy + dy;
       if(!inGrid(gx, gy)) continue;
-
       const p = gridToWorldCenter(gx, gy);
       const dist = Math.hypot(p.x - centerX, p.y - centerY);
       if(dist > radius) continue;
-
       const weight = 1 - (dist / radius);
       const delta = baseDelta * Math.max(0.15, weight);
       updateCellEvidence(gx, gy, delta, stamp);
@@ -329,7 +393,6 @@ function stampObstacleBlob(centerX, centerY, radiusM, baseDelta){
 
 function markRadarObservation(){
   maintainOccupancy();
-
   const pose = state.status.pose;
   const detectedDistance = clamp(state.currentEchoRange, 0.0, MAX_SENSOR_RANGE);
   const obstacleDetected = detectedDistance < (MAX_SENSOR_RANGE - RADAR_EPSILON);
@@ -340,16 +403,10 @@ function markRadarObservation(){
   const perpY = -Math.sin(angle);
   const stamp = Date.now();
 
-  const freeLimit = obstacleDetected
-    ? Math.max(0, detectedDistance - CELL_WORLD_SIZE * 1.4)
-    : detectedDistance;
-
+  const freeLimit = obstacleDetected ? Math.max(0, detectedDistance - CELL_WORLD_SIZE * 1.4) : detectedDistance;
   for(let distance = 0; distance <= freeLimit; distance += CELL_WORLD_SIZE * 0.7){
     const beamHalfWidth = clamp(0.015 + distance * 0.10, 0.015, 0.07);
-    const lateralOffsets = distance < 0.06
-      ? [0]
-      : [-beamHalfWidth * 0.65, 0, beamHalfWidth * 0.65];
-
+    const lateralOffsets = distance < 0.06 ? [0] : [-beamHalfWidth * 0.65, 0, beamHalfWidth * 0.65];
     for(const lateral of lateralOffsets){
       const x = pose.x + dirX * distance + perpX * lateral;
       const y = pose.y + dirY * distance + perpY * lateral;
@@ -363,13 +420,9 @@ function markRadarObservation(){
   if(obstacleDetected){
     const obstacleX = pose.x + dirX * detectedDistance;
     const obstacleY = pose.y + dirY * detectedDistance;
-
     const mainRadius = clamp(0.035 + detectedDistance * 0.10, 0.04, 0.09);
     stampObstacleBlob(obstacleX, obstacleY, mainRadius, detectedDistance < 0.20 ? LOG_ODDS_OCC_NEAR : LOG_ODDS_OCC);
-
-    // Un peu de masse derrière le premier écho pour que l'objet ressemble à un bloc
-    const behindSteps = [CELL_WORLD_SIZE * 0.8, CELL_WORLD_SIZE * 1.6];
-    behindSteps.forEach((behind, index) => {
+    [CELL_WORLD_SIZE * 0.8, CELL_WORLD_SIZE * 1.6].forEach((behind, index) => {
       const bx = obstacleX - dirX * behind;
       const by = obstacleY - dirY * behind;
       stampObstacleBlob(bx, by, Math.max(CELL_WORLD_SIZE * 1.2, mainRadius * (0.78 - index * 0.12)), LOG_ODDS_OCC * (0.58 - index * 0.16));
@@ -385,19 +438,16 @@ function probabilityAtWorld(x, y){
 
 function estimateRangeFromMap(rayAngle){
   let bestSoft = MAX_SENSOR_RANGE;
-
   for(let d = CELL_WORLD_SIZE * 0.5; d <= MAX_SENSOR_RANGE; d += CELL_WORLD_SIZE * 0.5){
     const x = state.status.pose.x + Math.sin(rayAngle) * d;
     const y = state.status.pose.y + Math.cos(rayAngle) * d;
     if(x < 0 || x > state.worldW || y < 0 || y > state.worldH) return d;
-
     const p = probabilityAtWorld(x, y);
     if(p >= VIEW_HIT_PROB) return d;
     if(p >= VIEW_SOFT_PROB){
       bestSoft = Math.min(bestSoft, d + (VIEW_HIT_PROB - p) / (VIEW_HIT_PROB - VIEW_SOFT_PROB) * CELL_WORLD_SIZE * 2);
     }
   }
-
   return bestSoft < MAX_SENSOR_RANGE ? bestSoft : MAX_SENSOR_RANGE;
 }
 
@@ -406,24 +456,16 @@ function drawGrid(ctx, canvas){
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-
   ctx.strokeStyle = '#dfe7f1';
   ctx.lineWidth = 1;
   for(let x = 0; x <= state.worldW * 10; x++){
     const px = ref.ox + (x / 10) * ref.scale;
-    ctx.beginPath();
-    ctx.moveTo(px, ref.oy);
-    ctx.lineTo(px, ref.oy + state.worldH * ref.scale);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(px, ref.oy); ctx.lineTo(px, ref.oy + state.worldH * ref.scale); ctx.stroke();
   }
   for(let y = 0; y <= state.worldH * 10; y++){
     const py = ref.oy + (y / 10) * ref.scale;
-    ctx.beginPath();
-    ctx.moveTo(ref.ox, py);
-    ctx.lineTo(ref.ox + state.worldW * ref.scale, py);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ref.ox, py); ctx.lineTo(ref.ox + state.worldW * ref.scale, py); ctx.stroke();
   }
-
   ctx.strokeStyle = '#000';
   ctx.lineWidth = 2;
   ctx.strokeRect(ref.ox, ref.oy, state.worldW * ref.scale, state.worldH * ref.scale);
@@ -432,25 +474,26 @@ function drawGrid(ctx, canvas){
 function drawOccupancy(ctx, canvas){
   const scale = worldToCanvas(0, 0, canvas).scale;
   const cellPx = Math.max(2, CELL_WORLD_SIZE * scale);
-
   for(const cell of state.occupancy.values()){
     const confidence = Math.abs(cell.prob - 50);
     if(confidence < PROB_MIN_DRAW) continue;
-
     const x = (cell.gx + 0.5) * CELL_WORLD_SIZE;
     const y = (cell.gy + 0.5) * CELL_WORLD_SIZE;
     const c = worldToCanvas(x, y, canvas);
-
-    if(cell.prob >= 50){
-      const alpha = clamp((cell.prob - 50) / 50, 0.14, 0.95);
-      ctx.fillStyle = `rgba(220, 40, 40, ${alpha})`;
-    } else {
-      const alpha = clamp((50 - cell.prob) / 50, 0.10, 0.82);
-      ctx.fillStyle = `rgba(0, 200, 200, ${alpha})`;
-    }
-
+    ctx.fillStyle = probabilityToColor(cell.prob);
     ctx.fillRect(c.x - cellPx / 2, c.y - cellPx / 2, cellPx, cellPx);
   }
+}
+
+function drawCross(ctx, pt, color, size){
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(pt.x - size, pt.y - size);
+  ctx.lineTo(pt.x + size, pt.y + size);
+  ctx.moveTo(pt.x - size, pt.y + size);
+  ctx.lineTo(pt.x + size, pt.y - size);
+  ctx.stroke();
 }
 
 function drawMap(){
@@ -467,19 +510,27 @@ function drawMap(){
     ctx.beginPath();
     state.trace.forEach((p, i) => {
       const c = worldToCanvas(p.x, p.y, canvas);
-      if(i === 0) ctx.moveTo(c.x, c.y);
-      else ctx.lineTo(c.x, c.y);
+      if(i === 0) ctx.moveTo(c.x, c.y); else ctx.lineTo(c.x, c.y);
     });
     ctx.stroke();
   }
 
-  if(state.destination){
-    const d = worldToCanvas(state.destination.x, state.destination.y, canvas);
+  const waypointWorld = serverGridToWorld(state.exploration.waypoint);
+  const targetWorld = serverGridToWorld(state.exploration.target);
+  if(targetWorld){
+    const t = worldToCanvas(targetWorld.x, targetWorld.y, canvas);
     ctx.strokeStyle = '#ffb300';
     ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.arc(d.x, d.y, 14, 0, Math.PI * 2);
-    ctx.stroke();
+    ctx.beginPath(); ctx.arc(t.x, t.y, 15, 0, Math.PI * 2); ctx.stroke();
+    drawCross(ctx, t, '#ffb300', 9);
+  }
+  if(waypointWorld){
+    const w = worldToCanvas(waypointWorld.x, waypointWorld.y, canvas);
+    ctx.fillStyle = '#8a4dff';
+    ctx.beginPath(); ctx.arc(w.x, w.y, 8, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(w.x, w.y, 8, 0, Math.PI * 2); ctx.stroke();
   }
 
   const pose = state.status.pose;
@@ -496,16 +547,11 @@ function drawMap(){
 
   ctx.strokeStyle = 'rgba(200, 180, 0, 0.95)';
   ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(robot.x, robot.y);
-  ctx.lineTo(beamEnd.x, beamEnd.y);
-  ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(robot.x, robot.y); ctx.lineTo(beamEnd.x, beamEnd.y); ctx.stroke();
 
   if(state.currentEchoRange < MAX_SENSOR_RANGE - RADAR_EPSILON){
     ctx.fillStyle = 'rgba(220, 40, 40, 0.95)';
-    ctx.beginPath();
-    ctx.arc(beamEnd.x, beamEnd.y, 5, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.beginPath(); ctx.arc(beamEnd.x, beamEnd.y, 5, 0, Math.PI * 2); ctx.fill();
   }
 
   ctx.save();
@@ -513,13 +559,9 @@ function drawMap(){
   ctx.rotate(angle);
   ctx.fillStyle = '#111';
   ctx.fillRect(-robotW / 2, -robotH / 2, robotW, robotH);
-
   ctx.strokeStyle = '#ffd500';
   ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(0, 0);
-  ctx.lineTo(0, -robotH / 2 - 18);
-  ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -robotH / 2 - 18); ctx.stroke();
   ctx.restore();
 }
 
@@ -527,7 +569,6 @@ function drawRobotView(){
   const canvas = qs('#robotView');
   resizeCanvas(canvas);
   const ctx = canvas.getContext('2d');
-
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = '#071638';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -550,12 +591,7 @@ function drawRobotView(){
     const h = state.fpsView[i] * canvas.height * 0.88;
     const intensity = clamp(0.22 + state.fpsView[i] * 0.95, 0.22, 1);
     ctx.fillStyle = `rgba(255, 120, 120, ${intensity})`;
-    ctx.fillRect(
-      i * barWidth + 4,
-      (canvas.height - h) / 2,
-      Math.max(6, barWidth - 8),
-      h
-    );
+    ctx.fillRect(i * barWidth + 4, (canvas.height - h) / 2, Math.max(6, barWidth - 8), h);
   }
 
   ctx.strokeStyle = 'rgba(255,255,255,0.35)';
@@ -564,36 +600,52 @@ function drawRobotView(){
 
   ctx.fillStyle = '#ffffff';
   ctx.font = '18px Arial';
-  ctx.fillText(
-    `Distance: ${state.status.distance_m == null ? '--' : state.status.distance_m.toFixed(2) + ' m'}`,
-    14,
-    28
-  );
+  ctx.fillText(`Distance: ${state.status.distance_m == null ? '--' : state.status.distance_m.toFixed(2) + ' m'}`, 14, 28);
 }
 
 function renderStatus(){
   const s = state.status;
+  const ex = state.exploration;
   const robotCls = s.robot_available ? 'online' : 'offline';
-  const robotTxt = s.robot_available ? 'ok' : '--';
-  const sensorTxt = s.sensor_available ? 'ok' : '--';
+  const socketCls = s.connected ? 'online' : 'offline';
   const dist = s.distance_m == null ? '--' : `${s.distance_m.toFixed(3)} m`;
   const probableWalls = Array.from(state.occupancy.values()).filter(c => c.prob >= 65).length;
   const observedCells = Array.from(state.occupancy.values()).filter(c => Math.abs(c.prob - 50) >= PROB_MIN_DRAW).length;
   const err = s.last_error ? `<div style="color:#cc241d;font-weight:700">Erreur : ${s.last_error}</div>` : '';
+  const exBadge = `<span class="badge ${ex.mode}">${ex.enabled ? titleCase(ex.mode) : 'IDLE'}</span>`;
+  const phaseBadge = `<span class="badge ${ex.phase}">${titleCase(ex.phase)}</span>`;
 
   qs('#statusText').innerHTML = `
-    <div>Socket : <span class="online">connectée</span></div>
-    <div>Robot : <span class="${robotCls}">${robotTxt}</span></div>
-    <div>Capteur : ${sensorTxt}</div>
-    <div>Mode : ${s.mode}</div>
+    <div>Socket : <span class="${socketCls}">${s.connected ? 'connectée' : 'déconnectée'}</span></div>
+    <div>Robot : <span class="${robotCls}">${s.robot_available ? 'ok' : '--'}</span></div>
+    <div>Capteur US : ${s.sensor_available ? 'ok' : '--'}</div>
+    <div>LineSensor : ${s.line_sensor_available ? 'ok' : '--'} (${s.line_sensors.left ? 'L1' : 'L0'} / ${s.line_sensors.center ? 'C1' : 'C0'} / ${s.line_sensors.right ? 'R1' : 'R0'})</div>
+    <div>Manette : ${state.gamepad.connected ? "ok" : "--"}${state.gamepad.connected ? " (" + state.gamepad.label + ")" : ""}</div>
+    <div>Moteur courant : ${titleCase(s.mode)}</div>
+    <div>Exploration : ${exBadge}</div>
+    <div>Phase algo : ${phaseBadge}</div>
     <div>X : ${s.pose.x.toFixed(2)} m</div>
     <div>Y : ${s.pose.y.toFixed(2)} m</div>
     <div>Angle : ${s.pose.angle_deg.toFixed(1)} °</div>
     <div>Distance : ${dist}</div>
+    <div>Secours : ${ex.recovery_side ? 'wall-follow ' + ex.recovery_side : '--'}</div>
     <div>Cases observées : ${observedCells}</div>
     <div>Murs probables (&ge;65%) : ${probableWalls}</div>
     ${err}
   `;
+
+  qs('#kpiMode').textContent = ex.enabled ? titleCase(ex.mode) : 'idle';
+  qs('#kpiPhase').textContent = titleCase(ex.phase);
+  qs('#kpiCoverage').textContent = fmtPct(ex.coverage || 0);
+  qs('#kpiReplans').textContent = String(ex.replans || 0);
+  qs('#kpiFrontiers').textContent = String(ex.visited_frontiers || 0);
+
+  ['btnRandom','btnBfs','btnDfs'].forEach(id => qs(`#${id}`).classList.remove('active'));
+  if(ex.enabled){
+    if(ex.mode === 'random') qs('#btnRandom').classList.add('active');
+    if(ex.mode === 'bfs') qs('#btnBfs').classList.add('active');
+    if(ex.mode === 'dfs') qs('#btnDfs').classList.add('active');
+  }
 }
 
 function redrawAll(){
@@ -606,7 +658,6 @@ function redrawAll(){
 function emitCommand(cmd){
   if(cmd === state.currentCommand) return;
   state.currentCommand = cmd;
-
   if(cmd === 'forward') socket.emit('goUp');
   else if(cmd === 'backward') socket.emit('goDown');
   else if(cmd === 'left') socket.emit('goLeft');
@@ -614,47 +665,168 @@ function emitCommand(cmd){
   else socket.emit('stopGo');
 }
 
-function computeCommandFromKeys(){
-  if(state.keys.ArrowUp) return 'forward';
-  if(state.keys.ArrowDown) return 'backward';
-  if(state.keys.ArrowLeft) return 'left';
-  if(state.keys.ArrowRight) return 'right';
-  return 'stop';
+function startExploration(mode){
+  state.currentCommand = 'stop';
+  state.manualActive = false;
+  pendingExplorationMode = mode;
+  if(pendingExplorationTimer) clearTimeout(pendingExplorationTimer);
+  pendingExplorationTimer = setTimeout(() => {
+    if(state.exploration.mode !== mode || !state.exploration.enabled){
+      addLog(`Le backend n'a pas confirmé ${titleCase(mode)}. Lance robot_backend_exploration.py et ouvre http://127.0.0.1:8765/ (pas file:///...).`);
+    }
+  }, 1600);
+  addLog(`Demande exploration ${titleCase(mode)} envoyée`);
+  socket.emit('startExploration', { mode });
 }
 
-function syncCommandFromKeys(){
-  emitCommand(computeCommandFromKeys());
+function computeCommandFromKeys(){
+  if(state.keys.ArrowUp) return { active: true, command: 'forward' };
+  if(state.keys.ArrowDown) return { active: true, command: 'backward' };
+  if(state.keys.ArrowLeft) return { active: true, command: 'left' };
+  if(state.keys.ArrowRight) return { active: true, command: 'right' };
+  return { active: false, command: 'stop' };
+}
+function computeCommandFromGamepad(){
+  if(state.gamepad.index == null) return { active: false, command: 'stop' };
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  const gp = pads && pads[state.gamepad.index];
+  if(!gp) return { active: false, command: 'stop' };
+
+  const axX = Number(gp.axes?.[0] || 0);
+  const axY = Number(gp.axes?.[1] || 0);
+  const dead = 0.35;
+  if(buttonPressed(gp, 0)) return { active: true, command: 'stop' };
+  if(Math.abs(axY) >= Math.abs(axX) && Math.abs(axY) > dead){
+    return { active: true, command: axY < 0 ? 'forward' : 'backward' };
+  }
+  if(Math.abs(axX) > dead){
+    return { active: true, command: axX < 0 ? 'left' : 'right' };
+  }
+  return { active: false, command: 'stop' };
+}
+function syncManualCommand(){
+  const keyCmd = computeCommandFromKeys();
+  const gamepadCmd = computeCommandFromGamepad();
+  const chosen = keyCmd.active ? keyCmd : gamepadCmd;
+
+  if(chosen.active){
+    state.manualActive = true;
+    emitCommand(chosen.command);
+    return;
+  }
+
+  if(state.manualActive){
+    state.manualActive = false;
+    emitCommand('stop');
+  }
 }
 
 function bindHoldButton(button, cmd){
-  button.addEventListener('pointerdown', e => {
-    e.preventDefault();
-    emitCommand(cmd);
-  });
-  button.addEventListener('pointerup', e => {
-    e.preventDefault();
-    emitCommand('stop');
-  });
+  button.addEventListener('pointerdown', e => { e.preventDefault(); emitCommand(cmd); });
+  button.addEventListener('pointerup', e => { e.preventDefault(); emitCommand('stop'); });
   button.addEventListener('pointerleave', () => emitCommand('stop'));
   button.addEventListener('contextmenu', e => e.preventDefault());
+}
+
+function resetLocalVisualMap(){
+  state.trace = [];
+  state.lastTracePoint = null;
+  state.occupancy = new Map();
+  state.fpsView = new Array(FPS_BAR_COUNT).fill(0.06);
+}
+
+function handleExplorationLog(ex){
+  const prev = state.prevExploration;
+  if(!prev){
+    state.prevExploration = JSON.parse(JSON.stringify(ex));
+    return;
+  }
+  if(prev.enabled !== ex.enabled || prev.mode !== ex.mode){
+    if(ex.enabled) addLog(`Exploration ${titleCase(ex.mode)} activée`);
+    else addLog('Exploration arrêtée');
+  }
+  if(prev.phase !== ex.phase){
+    addLog(`Phase algo: ${titleCase(ex.phase)}`);
+  }
+  state.prevExploration = JSON.parse(JSON.stringify(ex));
+}
+
+function setInputIfIdle(id, value){
+  const el = qs(`#${id}`);
+  if(!el) return;
+  if(document.activeElement === el) return;
+  el.value = String(value);
+}
+
+function populateExplorationConfig(cfg){
+  if(!cfg) return;
+  state.config = { ...state.config, ...cfg };
+  setInputIfIdle('cfgStopCm', (Number(state.config.safe_front_clearance_m || 0) * 100).toFixed(1));
+  setInputIfIdle('cfgSlowCm', (Number(state.config.slow_front_clearance_m || 0) * 100).toFixed(1));
+  setInputIfIdle('cfgDangerCm', (Number(state.config.danger_front_clearance_m || 0) * 100).toFixed(1));
+  setInputIfIdle('cfgAlgoSpeed', String(Math.round(Number(state.config.algo_speed || 72))));
+  setInputIfIdle('cfgWallFollowS', Number(state.config.wall_follow_duration_s || 0).toFixed(2));
+  setInputIfIdle('cfgAvoidTurnS', Number(state.config.avoid_turn_base_s || 0).toFixed(2));
+  setInputIfIdle('cfgBackoutS', Number(state.config.backout_duration_s || 0).toFixed(2));
+}
+
+function numValue(id, fallback){
+  const raw = Number(qs(`#${id}`).value);
+  return Number.isFinite(raw) ? raw : fallback;
+}
+
+function readExplorationConfig(){
+  return {
+    safe_front_clearance_m: clamp(numValue('cfgStopCm', 9) / 100, 0.03, 0.25),
+    slow_front_clearance_m: clamp(numValue('cfgSlowCm', 14) / 100, 0.04, 0.45),
+    danger_front_clearance_m: clamp(numValue('cfgDangerCm', 6) / 100, 0.02, 0.25),
+    algo_speed: clamp(Math.round(numValue('cfgAlgoSpeed', 72)), 40, 100),
+    wall_follow_duration_s: clamp(numValue('cfgWallFollowS', 2.8), 0.6, 8.0),
+    avoid_turn_base_s: clamp(numValue('cfgAvoidTurnS', 0.42), 0.12, 1.8),
+    backout_duration_s: clamp(numValue('cfgBackoutS', 0.55), 0.12, 1.8),
+  };
+}
+
+function openSimulationPage(){
+  const url = new URL('/simulation', APP_BASE_URL).toString();
+  window.open(url, '_blank', 'noopener');
 }
 
 function bind(){
   qs('#btnInit').onclick = () => socket.emit('initGPIO');
 
-  qs('#btnReset').onclick = () => {
-    state.trace = [];
-    state.lastTracePoint = null;
-    state.destination = null;
-    state.occupancy = new Map();
-    state.fpsView = new Array(FPS_BAR_COUNT).fill(0.06);
+  qs('#btnResetPose').onclick = () => {
+    resetLocalVisualMap();
     state.currentCommand = 'stop';
+    state.manualActive = false;
     socket.emit('resetPose');
-    addLog('Pose reset + carte probabiliste effacée');
+    addLog('Pose reset + cartes locale/serveur effacées');
     redrawAll();
   };
 
-  qs('#btnStop').onclick = () => emitCommand('stop');
+  qs('#btnStopManual').onclick = () => emitCommand('stop');
+  qs('#btnRandom').onclick = () => startExploration('random');
+  qs('#btnBfs').onclick = () => startExploration('bfs');
+  qs('#btnDfs').onclick = () => startExploration('dfs');
+  qs('#btnStopExploration').onclick = () => socket.emit('stopExploration');
+  qs('#btnApplyConfig').onclick = () => {
+    socket.emit('setExplorationConfig', readExplorationConfig());
+    addLog('Demande mise à jour des réglages envoyée');
+  };
+  qs('#btnResetConfig').onclick = () => {
+    socket.emit('resetExplorationConfig');
+    addLog('Demande reset réglages envoyée');
+  };
+  qs('#btnSimulation').onclick = () => {
+    openSimulationPage();
+    addLog('Ouverture du simulateur');
+  };
+  qs('#btnResetMap').onclick = () => {
+    resetLocalVisualMap();
+    socket.emit('resetExplorationMap');
+    addLog('Carte locale/serveur réinitialisée');
+    redrawAll();
+  };
 
   document.querySelectorAll('[data-cmd]').forEach(btn => {
     const cmd = btn.dataset.cmd;
@@ -665,21 +837,16 @@ function bind(){
   window.addEventListener('keydown', e => {
     if(!(e.key in state.keys) && e.key !== ' ') return;
     e.preventDefault();
-
-    if(e.key === ' '){
-      emitCommand('stop');
-      return;
-    }
-
+    if(e.key === ' '){ emitCommand('stop'); return; }
     state.keys[e.key] = true;
-    syncCommandFromKeys();
+    syncManualCommand();
   });
 
   window.addEventListener('keyup', e => {
     if(!(e.key in state.keys)) return;
     e.preventDefault();
     state.keys[e.key] = false;
-    syncCommandFromKeys();
+    syncManualCommand();
   });
 
   window.addEventListener('blur', () => {
@@ -687,23 +854,95 @@ function bind(){
     emitCommand('stop');
   });
 
-  const canvas = qs('#mapCanvas');
-  canvas.addEventListener('contextmenu', e => e.preventDefault());
-  canvas.addEventListener('mousedown', e => {
-    if(e.button !== 2) return;
-    const rect = canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    const p = canvasToWorld((e.clientX - rect.left) * dpr, (e.clientY - rect.top) * dpr, canvas);
-    state.destination = {x: p.x, y: p.y};
-    addLog(`Destination: (${p.x.toFixed(2)}, ${p.y.toFixed(2)})`);
-    drawMap();
+
+  window.addEventListener('gamepadconnected', e => {
+    state.gamepad.connected = true;
+    state.gamepad.index = e.gamepad.index;
+    state.gamepad.label = gamepadLabel(e.gamepad.id);
+    state.gamepad.buttonsPrev = [];
+    addLog(`Manette connectée: ${state.gamepad.label}`);
+    redrawAll();
+  });
+
+  window.addEventListener('gamepaddisconnected', e => {
+    if(state.gamepad.index === e.gamepad.index){
+      state.gamepad.connected = false;
+      state.gamepad.index = null;
+      state.gamepad.label = '';
+      state.gamepad.buttonsPrev = [];
+      state.manualActive = false;
+      emitCommand('stop');
+      addLog('Manette déconnectée');
+      redrawAll();
+    }
   });
 
   window.addEventListener('resize', redrawAll);
 }
 
-socket.on('connect', () => addLog('Socket connecté'));
-socket.on('robotStatus', msg => addLog(msg.message || 'Robot initialisé'));
+
+function handleGamepadButtons(){
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  const gp = state.gamepad.index == null ? null : pads[state.gamepad.index];
+  if(!gp){
+    if(state.gamepad.connected){
+      state.gamepad.connected = false;
+      state.gamepad.index = null;
+      state.gamepad.label = '';
+      state.gamepad.buttonsPrev = [];
+      state.manualActive = false;
+      emitCommand('stop');
+      redrawAll();
+    }
+    return;
+  }
+
+  state.gamepad.connected = true;
+  state.gamepad.label = gamepadLabel(gp.id);
+  const prev = state.gamepad.buttonsPrev || [];
+  const rising = idx => buttonPressed(gp, idx) && !prev[idx];
+
+  if(rising(9)){ socket.emit('initGPIO'); addLog('Manette: init robot'); }
+  if(rising(4)){ socket.emit('stopExploration'); addLog('Manette: stop exploration'); }
+  if(rising(2)){ startExploration('random'); addLog('Manette: random'); }
+  if(rising(3)){ startExploration('bfs'); addLog('Manette: bfs'); }
+  if(rising(1)){ startExploration('dfs'); addLog('Manette: dfs'); }
+  if(rising(0)){ emitCommand('stop'); }
+
+  state.gamepad.buttonsPrev = gp.buttons.map(b => !!b.pressed);
+}
+
+function gamepadLoop(){
+  try{
+    handleGamepadButtons();
+    if(state.gamepad.connected){
+      syncManualCommand();
+    }
+  }catch(err){
+    console.warn('gamepadLoop', err);
+  }
+  window.requestAnimationFrame(gamepadLoop);
+}
+socket.on('connect', () => {
+  state.status.connected = true;
+  addLog(`Socket connecté${SOCKET_URL ? ' vers ' + SOCKET_URL : ''}`);
+  socket.emit('getExplorationConfig');
+  redrawAll();
+});
+
+socket.on('disconnect', () => {
+  state.status.connected = false;
+  addLog('Socket déconnecté');
+  redrawAll();
+});
+
+socket.on('connect_error', err => {
+  state.status.connected = false;
+  addLog(`Connexion Socket impossible${SOCKET_URL ? ' vers ' + SOCKET_URL : ''}: ${err?.message || 'erreur inconnue'}`);
+  redrawAll();
+});
+
+socket.on('robotStatus', msg => addLog(msg.message || 'Message robot'));
 
 socket.on('robotPoseUpdate', data => {
   state.status.robot_available = !!data.robot_available;
@@ -714,8 +953,9 @@ socket.on('robotPoseUpdate', data => {
     y: Number(data.y || 0),
     angle_deg: Number(data.angle_deg ?? ((data.angle || 0) * 180 / Math.PI)),
   };
+  state.status.line_sensor_available = !!data.line_sensor_available;
+  state.status.line_sensors = data.line_sensors || {left:false, center:false, right:false};
   state.status.last_error = data.last_error || null;
-
   maybeAppendTracePoint(state.status.pose.x, state.status.pose.y);
   redrawAll();
 });
@@ -728,8 +968,35 @@ socket.on('echoRangeUpdate', data => {
   redrawAll();
 });
 
+socket.on('explorationConfig', data => {
+  populateExplorationConfig(data || {});
+  redrawAll();
+});
+
+socket.on('explorationState', data => {
+  state.exploration = {
+    enabled: !!data.enabled,
+    mode: String(data.mode || 'idle').toLowerCase(),
+    phase: String(data.phase || 'idle').toLowerCase(),
+    coverage: Number(data.coverage || 0),
+    replans: Number(data.replans || 0),
+    visited_frontiers: Number(data.visited_frontiers || 0),
+    waypoint: data.waypoint || null,
+    target: data.target || null,
+    recovery_side: data.recovery_side || null,
+  };
+  if(pendingExplorationMode && state.exploration.enabled && state.exploration.mode === pendingExplorationMode){
+    if(pendingExplorationTimer) clearTimeout(pendingExplorationTimer);
+    pendingExplorationTimer = null;
+    pendingExplorationMode = null;
+  }
+  handleExplorationLog(state.exploration);
+  redrawAll();
+});
+
 bind();
 redrawAll();
+gamepadLoop();
 setInterval(redrawAll, 1200);
 </script>
 </body>
