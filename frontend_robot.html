@@ -35,7 +35,6 @@ button.danger{color:var(--danger)}
 #mapCanvas{height:100%;min-height:650px;background:#fff}
 #robotView{background:#071638}
 .help{color:var(--muted);font-size:15px}
-.small-muted{font-size:14px;color:var(--muted)}
 @media (max-width:1180px){
   .layout{grid-template-columns:1fr}
   .canvas-card{height:760px}
@@ -65,7 +64,6 @@ button.danger{color:var(--danger)}
         <button data-cmd="stop">stop</button>
       </div>
       <p class="help">Flèches clavier = pilotage maintenu. Espace = stop. Clic droit = destination.</p>
-      <div class="small-muted">Le radar est calculé côté interface à partir de la pose simulée + la distance mesurée.</div>
     </section>
 
     <section class="card logs">
@@ -97,8 +95,9 @@ button.danger{color:var(--danger)}
   </aside>
 </div>
 
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script>
-const PI_BASE = "";
+const socket = io();
 
 const GRID_CELL_M = 0.08;
 const RADAR_MIN_M = 0.04;
@@ -108,7 +107,14 @@ const RADAR_MAX_CELLS = 2500;
 const state = {
   worldW: 6,
   worldH: 6,
-  status: null,
+  status: {
+    robot_available: false,
+    sensor_available: false,
+    mode: 'stop',
+    pose: {x: 3, y: 3, angle_deg: 0},
+    distance_m: null,
+    last_error: null,
+  },
   trace: [],
   occupancy: new Map(),
   logs: [],
@@ -135,20 +141,6 @@ function addLog(msg){
   const box = qs('#logBox');
   box.textContent = state.logs.slice(-22).join('\n');
   box.scrollTop = box.scrollHeight;
-}
-
-async function api(path, method='GET', payload=null){
-  const opts = {method, headers:{}};
-  if(payload !== null){
-    opts.headers['Content-Type'] = 'application/json';
-    opts.body = JSON.stringify(payload);
-  }
-  const r = await fetch(PI_BASE + path, opts);
-  const data = await r.json();
-  if(!r.ok || data.ok === false){
-    throw new Error(data.message || `HTTP ${r.status}`);
-  }
-  return data;
 }
 
 function resizeCanvas(canvas){
@@ -215,8 +207,6 @@ function drawGrid(ctx, canvas){
 
 function renderStatus(){
   const s = state.status;
-  if(!s) return;
-
   const robotCls = s.robot_available ? 'online' : 'offline';
   const robotTxt = s.robot_available ? 'ok' : '--';
   const sensorTxt = s.sensor_available ? 'ok' : '--';
@@ -225,7 +215,7 @@ function renderStatus(){
   const err = s.last_error ? `<div style="color:#cc241d;font-weight:700">Erreur : ${s.last_error}</div>` : '';
 
   qs('#statusText').innerHTML = `
-    <div>Backend : <span class="online">en ligne</span></div>
+    <div>Socket : <span class="online">connectée</span></div>
     <div>Robot : <span class="${robotCls}">${robotTxt}</span></div>
     <div>Capteur : ${sensorTxt}</div>
     <div>Mode : ${s.mode}</div>
@@ -281,20 +271,15 @@ function touchCell(gx, gy, deltaFree, deltaOcc){
   cell.occ += deltaOcc;
   cell.touchedAt = Date.now();
 
-  if(cell.free < -20) cell.free = -20;
-  if(cell.free > 20) cell.free = 20;
-  if(cell.occ < -20) cell.occ = -20;
-  if(cell.occ > 20) cell.occ = 20;
-
   if(state.occupancy.size > RADAR_MAX_CELLS){
     const entries = Array.from(state.occupancy.entries());
     entries.sort((a, b) => a[1].touchedAt - b[1].touchedAt);
-    const toDelete = entries.slice(0, 300);
-    toDelete.forEach(([k]) => state.occupancy.delete(k));
+    entries.slice(0, 300).forEach(([k]) => state.occupancy.delete(k));
   }
 }
 
-function markRadarObservation(s){
+function markRadarObservation(){
+  const s = state.status;
   if(!s || s.distance_m == null) return;
 
   const dist = Number(s.distance_m);
@@ -302,7 +287,6 @@ function markRadarObservation(s){
 
   const pose = s.pose;
   const ang = pose.angle_deg * Math.PI / 180.0;
-
   const step = GRID_CELL_M * 0.5;
 
   for(let r = step; r < dist; r += step){
@@ -313,7 +297,6 @@ function markRadarObservation(s){
 
     const gx = Math.round(x / GRID_CELL_M);
     const gy = Math.round(y / GRID_CELL_M);
-
     touchCell(gx, gy, 1, -0.2);
   }
 
@@ -358,9 +341,6 @@ function drawMap(){
   resizeCanvas(canvas);
   const ctx = canvas.getContext('2d');
   drawGrid(ctx, canvas);
-
-  if(!state.status) return;
-
   drawOccupancy(ctx, canvas);
 
   if(state.trace.length > 1){
@@ -387,10 +367,10 @@ function drawMap(){
   const pose = state.status.pose;
   const r = worldToCanvas(pose.x, pose.y, canvas);
   const robotPx = Math.max(10, r.scale * 0.11);
-  const angCanvas = (pose.angle_deg) * Math.PI / 180.0;
+  const angCanvas = (-pose.angle_deg) * Math.PI / 180.0;
+
   if(state.status.distance_m != null){
     const rayLen = Math.min(state.status.distance_m, 1.0) * r.scale;
-
     ctx.save();
     ctx.translate(r.x, r.y);
     ctx.rotate(angCanvas);
@@ -432,8 +412,6 @@ function drawRobotView(){
   ctx.fillStyle = grad;
   ctx.fillRect(0,0,w,h);
 
-  if(!state.status) return;
-
   ctx.fillStyle = '#15356a';
   ctx.fillRect(0, h * 0.55, w, h * 0.45);
 
@@ -457,29 +435,15 @@ function drawRobotView(){
   );
 }
 
-async function refresh(){
-  try{
-    const s = await api('/status');
-    state.status = s;
-    maybeAppendTracePoint(s.pose.x, s.pose.y);
-    markRadarObservation(s);
-    renderStatus();
-    drawMap();
-    drawRobotView();
-  }catch(err){
-    addLog('Erreur status: ' + err.message);
-  }
-}
-
-async function setDrive(cmd){
+function emitCommand(cmd){
   if(cmd === state.currentCommand) return;
   state.currentCommand = cmd;
-  try{
-    await api('/move', 'POST', {command: cmd});
-    addLog('Commande: ' + cmd);
-  }catch(err){
-    addLog('Erreur commande: ' + err.message);
-  }
+
+  if(cmd === 'forward') socket.emit('goUp');
+  else if(cmd === 'backward') socket.emit('goDown');
+  else if(cmd === 'left') socket.emit('goLeft');
+  else if(cmd === 'right') socket.emit('goRight');
+  else socket.emit('stopGo');
 }
 
 function computeCommandFromKeys(){
@@ -491,56 +455,44 @@ function computeCommandFromKeys(){
 }
 
 function syncCommandFromKeys(){
-  setDrive(computeCommandFromKeys());
+  emitCommand(computeCommandFromKeys());
 }
 
 function bindHoldButton(button, cmd){
   button.addEventListener('pointerdown', e => {
     e.preventDefault();
-    setDrive(cmd);
+    emitCommand(cmd);
   });
   button.addEventListener('pointerup', e => {
     e.preventDefault();
-    setDrive('stop');
+    emitCommand('stop');
   });
   button.addEventListener('pointerleave', () => {
-    setDrive('stop');
+    emitCommand('stop');
   });
   button.addEventListener('contextmenu', e => e.preventDefault());
 }
 
 function bind(){
-  qs('#btnInit').onclick = async () => {
-    try{
-      await api('/init', 'POST', {});
-      state.currentCommand = 'stop';
-      addLog('Robot initialisé');
-      await refresh();
-    }catch(err){
-      addLog('Init: ' + err.message);
-    }
+  qs('#btnInit').onclick = () => {
+    socket.emit('initGPIO');
   };
 
-  qs('#btnReset').onclick = async () => {
-    try{
-      await api('/reset_pose', 'POST', {});
-      state.trace = [];
-      state.occupancy = new Map();
-      state.lastTracePoint = null;
-      state.currentCommand = 'stop';
-      addLog('Pose reset + radar effacé');
-      await refresh();
-    }catch(err){
-      addLog('Reset: ' + err.message);
-    }
+  qs('#btnReset').onclick = () => {
+    state.trace = [];
+    state.occupancy = new Map();
+    state.lastTracePoint = null;
+    state.currentCommand = 'stop';
+    socket.emit('resetPose');
+    addLog('Pose reset + radar effacé');
   };
 
-  qs('#btnStop').onclick = () => setDrive('stop');
+  qs('#btnStop').onclick = () => emitCommand('stop');
 
   document.querySelectorAll('[data-cmd]').forEach(btn => {
     const cmd = btn.dataset.cmd;
     if(cmd === 'stop'){
-      btn.onclick = () => setDrive('stop');
+      btn.onclick = () => emitCommand('stop');
     } else {
       bindHoldButton(btn, cmd);
     }
@@ -551,7 +503,7 @@ function bind(){
     e.preventDefault();
 
     if(e.key === ' '){
-      setDrive('stop');
+      emitCommand('stop');
       return;
     }
 
@@ -568,7 +520,7 @@ function bind(){
 
   window.addEventListener('blur', () => {
     Object.keys(state.keys).forEach(k => state.keys[k] = false);
-    setDrive('stop');
+    emitCommand('stop');
   });
 
   const canvas = qs('#mapCanvas');
@@ -589,9 +541,43 @@ function bind(){
   });
 }
 
+socket.on('connect', () => {
+  addLog('Socket connecté');
+});
+
+socket.on('robotStatus', msg => {
+  addLog(msg.message || 'Robot initialisé');
+});
+
+socket.on('robotPoseUpdate', data => {
+  state.status.robot_available = !!data.robot_available;
+  state.status.sensor_available = !!data.sensor_available;
+  state.status.mode = data.mode || 'stop';
+  state.status.pose = {
+    x: Number(data.x || 0),
+    y: Number(data.y || 0),
+    angle_deg: Number(data.angle_deg || 0),
+  };
+  state.status.last_error = data.last_error || null;
+
+  maybeAppendTracePoint(state.status.pose.x, state.status.pose.y);
+  renderStatus();
+  drawMap();
+  drawRobotView();
+});
+
+socket.on('echoRangeUpdate', data => {
+  state.status.distance_m = Number(data.range ?? 1.0);
+  markRadarObservation();
+  renderStatus();
+  drawMap();
+  drawRobotView();
+});
+
 bind();
-refresh();
-setInterval(refresh, 50);
+renderStatus();
+drawMap();
+drawRobotView();
 </script>
 </body>
 </html>

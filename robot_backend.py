@@ -8,8 +8,8 @@ import threading
 import time
 from typing import Optional
 
-from flask import Flask, jsonify, request, send_from_directory
-from flask_cors import CORS
+from flask import Flask, send_from_directory
+from flask_socketio import SocketIO
 
 import robot_utils
 
@@ -21,14 +21,23 @@ WORLD_H = 6.0
 
 LINEAR_SPEED = 0.10      # m/s
 ANGULAR_SPEED = 1.22     # rad/s
-MAX_SENSOR_RANGE_M = 1.0
+MAX_SENSOR_RANGE = 1.0
 
 app = Flask(__name__)
+app.config["SECRET_KEY"] = "secret!"
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="threading",
+    logger=True,
+    engineio_logger=True,
+)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CORS(app)
 
 robot_lock = threading.Lock()
 robot: Optional[robot_utils.Robot] = None
+background_started = False
 
 pose = {
     "x": WORLD_W / 2,
@@ -37,7 +46,7 @@ pose = {
 }
 
 motion_state = {
-    "mode": "stop",   # forward, backward, left, right, stop
+    "mode": "stop",
     "updated_at": time.time(),
 }
 
@@ -48,7 +57,10 @@ state = {
     "last_error": None,
 }
 
-last_motion_cmd = "stop"
+
+@app.route("/", methods=["GET"])
+def index():
+    return send_from_directory(BASE_DIR, "frontend_robot.html")
 
 
 def clamp(v: float, a: float, b: float) -> float:
@@ -63,21 +75,12 @@ def normalize_angle(angle: float) -> float:
     return angle
 
 
-def ensure_robot() -> None:
-    global robot
-    if robot is None:
-        robot = robot_utils.Robot(speed=90)
-        state["robot_available"] = True
-        state["sensor_available"] = True
-        state["last_error"] = None
-
-
-def set_motion(mode: str) -> None:
+def set_motion(mode: str):
     motion_state["mode"] = mode
     motion_state["updated_at"] = time.time()
 
 
-def update_pose(dt: float) -> None:
+def update_pose(dt: float):
     mode = motion_state["mode"]
 
     if mode == "forward":
@@ -96,21 +99,39 @@ def update_pose(dt: float) -> None:
     pose["y"] = clamp(float(pose["y"]), 0.0, WORLD_H)
 
 
-def get_sensor_distance_safe() -> float:
+def get_sensor_distance_safe():
     global robot
     if robot is None:
-        return 1.0
+        return None
 
     try:
         distance = robot.get_sensor_distance()
         if distance is None:
-            return 1.0
+            return None
         return float(distance)
     except Exception:
-        return 1.0
+        return None
 
 
-def telemetry_loop() -> None:
+def emit_full_state():
+    socketio.emit("robotPoseUpdate", {
+        "x": pose["x"],
+        "y": pose["y"],
+        "angle": pose["angle"],
+        "angle_deg": math.degrees(pose["angle"]),
+        "mode": motion_state["mode"],
+        "robot_available": state["robot_available"],
+        "sensor_available": state["sensor_available"],
+        "last_error": state["last_error"],
+    })
+
+    socketio.emit("echoRangeUpdate", {
+        "range": state["distance_m"] if state["distance_m"] is not None else 1.0
+    })
+
+
+def telemetry_loop():
+    print(">>> telemetry_loop démarrée")
     last_time = time.time()
 
     while True:
@@ -121,112 +142,78 @@ def telemetry_loop() -> None:
         with robot_lock:
             try:
                 update_pose(dt)
-                state["distance_m"] = clamp(get_sensor_distance_safe(), 0.0, MAX_SENSOR_RANGE_M)
-                state["sensor_available"] = True
+
+                if robot is None:
+                    state["distance_m"] = None
+                    state["sensor_available"] = False
+                else:
+                    d = get_sensor_distance_safe()
+                    state["distance_m"] = clamp(d, 0.0, MAX_SENSOR_RANGE) if d is not None else None
+                    state["sensor_available"] = d is not None
+
             except Exception as exc:
                 state["last_error"] = str(exc)
+                state["sensor_available"] = False
 
-        time.sleep(0.05)   # 20 Hz, comme l'ancienne version
+            emit_full_state()
 
-
-def apply_robot_mode(mode: str) -> None:
-    global last_motion_cmd
-
-    set_motion(mode)
-
-    if robot is None:
-        return
-
-    if mode == last_motion_cmd:
-        return
-
-    if mode == "forward":
-        robot.avance()
-    elif mode == "backward":
-        robot.recule()
-    elif mode == "left":
-        robot.gauche()
-    elif mode == "right":
-        robot.droite()
-    else:
-        robot.stop()
-
-    last_motion_cmd = mode
+        socketio.sleep(0.05)   # 20 Hz
 
 
-@app.get("/health")
-def health():
-    return jsonify({"ok": True, "message": "robot backend actif"})
+def ensure_background_task():
+    global background_started
+    if not background_started:
+        print(">>> lancement background task")
+        background_started = True
+        socketio.start_background_task(target=telemetry_loop)
 
 
-@app.get("/status")
-def status():
-    return jsonify({
-        "robot_available": state["robot_available"],
-        "sensor_available": state["sensor_available"],
-        "mode": motion_state["mode"],
-        "pose": {
-            "x": pose["x"],
-            "y": pose["y"],
-            "angle_deg": math.degrees(pose["angle"]),
-        },
-        "distance_m": state["distance_m"],
-        "last_error": state["last_error"],
-    })
+@socketio.on_error_default
+def default_error_handler(e):
+    import traceback
+    print(">>> SocketIO error:", repr(e))
+    traceback.print_exc()
 
 
-@app.post("/init")
-def init_robot():
-    try:
-        with robot_lock:
-            ensure_robot()
-            apply_robot_mode("stop")
-        return jsonify({"ok": True, "message": "robot initialisé", "robot_available": True})
-    except Exception as exc:
-        state["robot_available"] = False
-        state["sensor_available"] = False
-        state["last_error"] = str(exc)
-        return jsonify({"ok": False, "message": f"init impossible: {exc}"}), 500
+@socketio.on("connect")
+def on_connect():
+    print(">>> client connecté")
+    ensure_background_task()
+    emit_full_state()
 
 
-@app.post("/move")
-def move():
-    data = request.get_json(force=True, silent=True) or {}
-    cmd = str(data.get("command", "stop")).strip().lower()
+@socketio.on("initGPIO")
+def init_gpio(_data=None):
+    global robot
 
-    if cmd not in {"forward", "backward", "left", "right", "stop"}:
-        return jsonify({"ok": False, "message": f"commande inconnue: {cmd}"}), 400
+    print(">>> initGPIO reçu")
 
     try:
         with robot_lock:
             if robot is None:
-                return jsonify({
-                    "ok": False,
-                    "message": "robot non initialisé, clique d'abord sur Init robot"
-                }), 400
-            apply_robot_mode(cmd)
-        return jsonify({"ok": True, "mode": motion_state["mode"]})
+                print(">>> création de robot_utils.Robot(...)")
+                robot = robot_utils.Robot(speed=90)
+
+            state["robot_available"] = True
+            state["sensor_available"] = True
+            state["last_error"] = None
+
+        ensure_background_task()
+        print(">>> robot initialisé OK")
+        socketio.emit("robotStatus", {"ok": True, "message": "Robot initialisé"})
+        emit_full_state()
+
     except Exception as exc:
+        state["robot_available"] = False
+        state["sensor_available"] = False
         state["last_error"] = str(exc)
-        return jsonify({"ok": False, "message": str(exc)}), 500
+        print(">>> initGPIO erreur:", repr(exc))
+        socketio.emit("robotStatus", {"ok": False, "message": f"Init impossible: {exc}"})
+        emit_full_state()
 
 
-@app.post("/stop")
-def stop():
-    try:
-        with robot_lock:
-            if robot is not None:
-                robot.stop()
-            apply_robot_mode("stop")
-        return jsonify({"ok": True, "mode": "stop"})
-    except Exception as exc:
-        state["last_error"] = str(exc)
-        return jsonify({"ok": False, "message": str(exc)}), 500
-
-
-@app.post("/reset_pose")
-def reset_pose():
-    global last_motion_cmd
+@socketio.on("resetPose")
+def reset_pose(_data=None):
     with robot_lock:
         pose["x"] = WORLD_W / 2
         pose["y"] = WORLD_H / 2
@@ -234,7 +221,6 @@ def reset_pose():
         set_motion("stop")
         state["distance_m"] = None
         state["last_error"] = None
-        last_motion_cmd = "stop"
 
         if robot is not None:
             try:
@@ -242,32 +228,73 @@ def reset_pose():
             except Exception:
                 pass
 
-    return jsonify({"ok": True})
+    emit_full_state()
 
 
-@app.post("/cleanup")
-def cleanup():
-    global robot, last_motion_cmd
-    try:
-        with robot_lock:
-            if robot is not None:
+@socketio.on("goUp")
+def go_up(_data=None):
+    global robot
+    with robot_lock:
+        set_motion("forward")
+        if robot is not None:
+            robot.avance()
+
+
+@socketio.on("goDown")
+def go_down(_data=None):
+    global robot
+    with robot_lock:
+        set_motion("backward")
+        if robot is not None:
+            robot.recule()
+
+
+@socketio.on("goLeft")
+def go_left(_data=None):
+    global robot
+    with robot_lock:
+        set_motion("left")
+        if robot is not None:
+            robot.gauche()
+
+
+@socketio.on("goRight")
+def go_right(_data=None):
+    global robot
+    with robot_lock:
+        set_motion("right")
+        if robot is not None:
+            robot.droite()
+
+
+@socketio.on("stopGo")
+def stop_go(_data=None):
+    global robot
+    with robot_lock:
+        set_motion("stop")
+        if robot is not None:
+            robot.stop()
+
+
+@socketio.on("cleanupGPIO")
+def cleanup_gpio(_data=None):
+    global robot
+    with robot_lock:
+        if robot is not None:
+            try:
                 robot.cleanup()
-            robot = None
-            last_motion_cmd = "stop"
-            state["robot_available"] = False
-            state["sensor_available"] = False
-            state["distance_m"] = None
-        return jsonify({"ok": True})
-    except Exception as exc:
-        state["last_error"] = str(exc)
-        return jsonify({"ok": False, "message": str(exc)}), 500
+            except Exception:
+                pass
+        robot = None
+        state["robot_available"] = False
+        state["sensor_available"] = False
+        state["distance_m"] = None
+        set_motion("stop")
 
-
-@app.get("/")
-def index():
-    return send_from_directory(BASE_DIR, "frontend_robot.html")
+    emit_full_state()
 
 
 if __name__ == "__main__":
-    threading.Thread(target=telemetry_loop, daemon=True).start()
-    app.run(host=HOST, port=PORT, debug=False, threaded=True)
+    print(f"SocketIO mode = {socketio.async_mode}")
+    print(f"Serveur en cours sur http://127.0.0.1:{PORT} et http://0.0.0.0:{PORT}")
+    socketio.run(app, host=HOST, port=PORT, debug=False, allow_unsafe_werkzeug=True)
