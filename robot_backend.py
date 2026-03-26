@@ -23,14 +23,14 @@ import robot_utils
 HOST = "0.0.0.0"
 PORT = 8765
 
-WORLD_W = 6.0
-WORLD_H = 6.0
+WORLD_W = 4.0
+WORLD_H = 4.0
 
 LINEAR_SPEED = 0.10      # m/s estimate from odometry integration
 ANGULAR_SPEED = 1.22     # rad/s estimate from odometry integration
 MAX_SENSOR_RANGE = 0.50  # ultrasonic useful range
 MANUAL_SPEED = 90
-ALGO_SPEED = 72
+ALGO_SPEED = 100
 
 # Optional line sensors (very short range / binary cues).
 LINE_SENSOR_PINS = {"left": 19, "center": 16, "right": 20}
@@ -60,8 +60,8 @@ UNKNOWN_BAND_HIGH = 0.62
 # Simple robot geometry / safety.
 ROBOT_RADIUS_M = 0.10
 PATH_OBSTACLE_MARGIN_CELLS = 0
-SAFE_FRONT_CLEARANCE_M = 0.09
-SLOW_FRONT_CLEARANCE_M = 0.14
+SAFE_FRONT_CLEARANCE_M = 0.22
+SLOW_FRONT_CLEARANCE_M = 0.30
 WAYPOINT_REACHED_M = 0.07
 ANGLE_TOL = math.radians(12.0)
 
@@ -73,11 +73,11 @@ SEARCH_SWEEP_ANGLE = math.radians(300.0)
 SEARCH_MOVE_DURATION_S = 1.10
 SEARCH_MIN_SCORE = 0.16
 WAYPOINTS_BEFORE_RESCAN = 6
-WALL_FOLLOW_DURATION_S = 2.8
-AVOID_TURN_BASE_S = 0.42
+WALL_FOLLOW_DURATION_S = 1.8
+AVOID_TURN_BASE_S = 0.80
 AVOID_TURN_CORNER_BONUS_S = 0.22
-BACKOUT_DURATION_S = 0.55
-DANGER_FRONT_CLEARANCE_M = 0.06
+BACKOUT_DURATION_S = 0.75
+DANGER_FRONT_CLEARANCE_M = 0.14
 
 DEFAULT_EXPLORATION_CONFIG = {
     "safe_front_clearance_m": SAFE_FRONT_CLEARANCE_M,
@@ -536,6 +536,8 @@ def update_occupancy_from_line_sensors(readings: Optional[Dict[str, bool]]) -> N
 
 
 def find_path_to_frontier(start: Tuple[int, int], strategy: str) -> List[Tuple[int, int]]:
+    best_cell = None
+    best_score = -1e9
     if not in_bounds(*start):
         return []
     if classify_cell(*start) == "unknown":
@@ -563,7 +565,22 @@ def find_path_to_frontier(start: Tuple[int, int], strategy: str) -> List[Tuple[i
         while fringe2:
             cell = fringe2.pop()
             if cell != start and is_frontier(*cell):
-                return reconstruct_path(parent, cell)
+                path_len = 0
+                cur = cell
+                while cur is not None:
+                    path_len += 1
+                    cur = parent[cur]
+
+                unknown_neighbors = sum(
+                    1 for nx, ny in neighbors8(*cell)
+                    if in_bounds(nx, ny) and classify_cell(nx, ny) == "unknown"
+                )
+
+                score = unknown_neighbors * 10.0 - path_len
+                if score > best_score:
+                    best_score = score
+                    best_cell = cell
+                continue
             # Reverse order so the first logical neighbor is explored deeper first.
             nbs = list(ordered_neighbors(cell))
             nbs.reverse()
@@ -572,6 +589,8 @@ def find_path_to_frontier(start: Tuple[int, int], strategy: str) -> List[Tuple[i
                     visited.add(nxt)
                     parent[nxt] = cell
                     fringe2.append(nxt)
+    if best_cell is not None:
+        return reconstruct_path(parent, best_cell)
     return []
 
 
@@ -622,11 +641,11 @@ def heading_unknown_bonus(angle: float, max_range: float = 0.45) -> float:
         seen.add((gx, gy))
         cls = classify_cell(gx, gy)
         if cls == "unknown":
-            score += 0.055
+            score += 0.12
         elif cls == "free":
-            score += 0.010
+            score -= 0.005
         else:
-            score -= 0.030
+            score -= 0.05
             break
         r += CELL_M
     return score
@@ -636,7 +655,7 @@ def current_search_heading_score() -> float:
     front = state.get("distance_m")
     ls = state.get("line_sensors", {})
     clearance = MAX_SENSOR_RANGE * 0.85 if front is None else float(front)
-    score = clearance * 1.9 + heading_unknown_bonus(pose["angle"])
+    score = clearance * 1.15 + 3.0 * heading_unknown_bonus(pose["angle"])
     if ls.get("center"):
         score -= 0.35
     if ls.get("left") and ls.get("right"):
