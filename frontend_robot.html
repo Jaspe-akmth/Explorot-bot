@@ -8,7 +8,7 @@
 :root{
   --bg:#eef2f7; --card:#ffffff; --line:#d8e0eb; --text:#0f2748; --muted:#5b6f8b;
   --blue:#3164e0; --danger:#e33b30; --robot:#101010; --trace:#00d9ff; --dest:#ffb300;
-  --obs:#ff5f5f; --scan:#c8b400;
+  --obs:#ff5f5f; --scan:#c8b400; --free:#00b7c7;
 }
 *{box-sizing:border-box}
 body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text)}
@@ -31,11 +31,12 @@ button.danger{color:var(--danger)}
 .dot.dest{background:var(--dest)}
 .dot.obs{background:var(--obs)}
 .dot.trace{background:var(--trace)}
-.dot.free{background:rgba(0,200,200,.8)}
+.dot.free{background:var(--free)}
 #mapCanvas,#robotView{width:100%;border:1px solid var(--line);border-radius:18px}
 #mapCanvas{height:100%;min-height:650px;background:#fff}
-#robotView{background:#fff;height:500px}
+#robotView{background:#071638;height:500px}
 .help{color:var(--muted);font-size:15px}
+.small{font-size:14px;color:var(--muted);margin-top:8px}
 @media (max-width:1180px){
   .layout{grid-template-columns:1fr}
   .canvas-card{height:760px}
@@ -53,6 +54,7 @@ button.danger{color:var(--danger)}
         <button id="btnReset">Reset pose</button>
         <button id="btnStop" class="danger">STOP</button>
       </div>
+      <div class="small">Carte probabiliste : 0% = libre probable, 100% = mur probable.</div>
     </section>
 
     <section class="card">
@@ -80,8 +82,8 @@ button.danger{color:var(--danger)}
         <div class="legend">
           <span><i class="dot robot"></i>robot</span>
           <span><i class="dot dest"></i>destination</span>
-          <span><i class="dot free"></i>zone libre</span>
-          <span><i class="dot obs"></i>obstacle</span>
+          <span><i class="dot free"></i>libre probable</span>
+          <span><i class="dot obs"></i>mur probable</span>
           <span><i class="dot trace"></i>trace</span>
         </div>
       </div>
@@ -93,6 +95,7 @@ button.danger{color:var(--danger)}
     <section class="card">
       <h2>Vue robot</h2>
       <canvas id="robotView" width="360" height="500"></canvas>
+      <div class="small">Les 11 barres viennent de la carte mémorisée + de la mesure actuelle, donc les obstacles ressortent en blocs plus stables.</div>
     </section>
   </aside>
 </div>
@@ -101,11 +104,22 @@ button.danger{color:var(--danger)}
 <script>
 const socket = io();
 
-const CELL_WORLD_SIZE = 0.01;      // 1 cm par case
-const MAX_SENSOR_RANGE = 0.5;      // fidèle à index.js
+const CELL_WORLD_SIZE = 0.02;        // 2 cm : mieux adapté au bruit du capteur ultrason
+const MAX_SENSOR_RANGE = 0.5;        // cohérent avec le projet de référence
 const RADAR_EPSILON = 0.02;
-const RADAR_MAX_CELLS = 50000;
+const RADAR_MAX_CELLS = 25000;
 const FPS_BAR_COUNT = 11;
+const VIEW_FOV_RAD = 0.95;
+const VIEW_HIT_PROB = 68;
+const VIEW_SOFT_PROB = 58;
+const PROB_MIN_DRAW = 8;
+
+const LOG_ODDS_OCC = 0.95;
+const LOG_ODDS_OCC_NEAR = 1.35;
+const LOG_ODDS_FREE = -0.42;
+const LOG_ODDS_FREE_SIDE = -0.18;
+const LOG_ODDS_MIN = -4.6;
+const LOG_ODDS_MAX = 4.6;
 
 const state = {
   worldW: 6,
@@ -130,11 +144,18 @@ const state = {
     ArrowLeft: false,
     ArrowRight: false,
   },
-  occupancy: new Map(), // key => {gx, gy, value, touchedAt}
+  occupancy: new Map(), // key => {gx, gy, logOdds, prob, touchedAt, updatedAt}
+  fpsView: new Array(FPS_BAR_COUNT).fill(0.06),
+  lastMaintenanceAt: 0,
 };
 
 function qs(sel){ return document.querySelector(sel); }
 function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
+function lerp(a, b, t){ return a + (b - a) * t; }
+
+function logOddsToProb(logOdds){
+  return 100 / (1 + Math.exp(-logOdds));
+}
 
 function addLog(msg){
   const d = new Date();
@@ -142,9 +163,9 @@ function addLog(msg){
   const mm = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
   state.logs.push(`[${hh}:${mm}:${ss}] ${msg}`);
-  state.logs = state.logs.slice(-160);
+  state.logs = state.logs.slice(-180);
   const box = qs('#logBox');
-  box.textContent = state.logs.slice(-22).join('\n');
+  box.textContent = state.logs.slice(-24).join('\n');
   box.scrollTop = box.scrollHeight;
 }
 
@@ -189,7 +210,7 @@ function maybeAppendTracePoint(x, y){
   }
 
   const dist = Math.hypot(x - state.lastTracePoint.x, y - state.lastTracePoint.y);
-  if(dist >= CELL_WORLD_SIZE){
+  if(dist >= CELL_WORLD_SIZE * 0.75){
     state.trace.push({x, y});
     state.lastTracePoint = {x, y};
   }
@@ -210,77 +231,174 @@ function worldToGrid(x, y){
   };
 }
 
+function gridToWorldCenter(gx, gy){
+  return {
+    x: (gx + 0.5) * CELL_WORLD_SIZE,
+    y: (gy + 0.5) * CELL_WORLD_SIZE,
+  };
+}
+
 function inGrid(gx, gy){
   return gx >= 0 && gx < Math.floor(state.worldW / CELL_WORLD_SIZE) && gy >= 0 && gy < Math.floor(state.worldH / CELL_WORLD_SIZE);
 }
 
-function setCellIfUnknownOrFree(gx, gy, value){
-  if(!inGrid(gx, gy)) return;
-
+function getCell(gx, gy, create = false){
+  if(!inGrid(gx, gy)) return null;
   const key = cellKey(gx, gy);
   let cell = state.occupancy.get(key);
-  if(!cell){
-    cell = {gx, gy, value: 0, touchedAt: Date.now()};
+  if(!cell && create){
+    cell = {
+      gx,
+      gy,
+      logOdds: 0,
+      prob: 50,
+      touchedAt: Date.now(),
+      updatedAt: Date.now(),
+    };
     state.occupancy.set(key, cell);
   }
+  return cell || null;
+}
 
-  if(cell.value === 2) return;        // ne remplace jamais la trace du robot
-  if(cell.value === 3 && value === 1) return; // ne remplace pas obstacle par libre
+function updateCellEvidence(gx, gy, delta, stamp = Date.now()){
+  const cell = getCell(gx, gy, true);
+  if(!cell) return;
 
-  cell.value = value;
-  cell.touchedAt = Date.now();
+  const idleMs = stamp - cell.updatedAt;
+  if(idleMs > 0){
+    const relax = Math.exp(-idleMs / 65000);
+    cell.logOdds *= relax;
+  }
+
+  cell.logOdds = clamp(cell.logOdds + delta, LOG_ODDS_MIN, LOG_ODDS_MAX);
+  cell.prob = logOddsToProb(cell.logOdds);
+  cell.touchedAt = stamp;
+  cell.updatedAt = stamp;
+}
+
+function maintainOccupancy(){
+  const now = Date.now();
+  if(now - state.lastMaintenanceAt < 900) return;
+  state.lastMaintenanceAt = now;
+
+  for(const [key, cell] of state.occupancy.entries()){
+    const ageMs = now - cell.updatedAt;
+    const relax = Math.exp(-(now - cell.touchedAt) / 110000);
+    cell.logOdds *= relax;
+    cell.prob = logOddsToProb(cell.logOdds);
+    cell.touchedAt = now;
+
+    const confidence = Math.abs(cell.prob - 50);
+    if(ageMs > 120000 || (ageMs > 12000 && confidence < 4)){
+      state.occupancy.delete(key);
+    }
+  }
 
   if(state.occupancy.size > RADAR_MAX_CELLS){
-    const entries = Array.from(state.occupancy.entries()).sort((a, b) => a[1].touchedAt - b[1].touchedAt);
-    entries.slice(0, 1000).forEach(([k]) => state.occupancy.delete(k));
+    const entries = Array.from(state.occupancy.entries()).sort((a, b) => {
+      const aScore = (Math.abs(a[1].prob - 50) * 20) - (now - a[1].updatedAt) / 1000;
+      const bScore = (Math.abs(b[1].prob - 50) * 20) - (now - b[1].updatedAt) / 1000;
+      return aScore - bScore;
+    });
+    entries.slice(0, state.occupancy.size - RADAR_MAX_CELLS).forEach(([k]) => state.occupancy.delete(k));
   }
 }
 
-function markRobotCell(){
-  const {gx, gy} = worldToGrid(state.status.pose.x, state.status.pose.y);
-  if(!inGrid(gx, gy)) return;
+function stampObstacleBlob(centerX, centerY, radiusM, baseDelta){
+  const stamp = Date.now();
+  const radius = Math.max(CELL_WORLD_SIZE * 1.5, radiusM);
+  const rCells = Math.ceil(radius / CELL_WORLD_SIZE);
+  const centerGrid = worldToGrid(centerX, centerY);
 
-  const key = cellKey(gx, gy);
-  const cell = {gx, gy, value: 2, touchedAt: Date.now()};
-  state.occupancy.set(key, cell);
+  for(let dx = -rCells; dx <= rCells; dx++){
+    for(let dy = -rCells; dy <= rCells; dy++){
+      const gx = centerGrid.gx + dx;
+      const gy = centerGrid.gy + dy;
+      if(!inGrid(gx, gy)) continue;
+
+      const p = gridToWorldCenter(gx, gy);
+      const dist = Math.hypot(p.x - centerX, p.y - centerY);
+      if(dist > radius) continue;
+
+      const weight = 1 - (dist / radius);
+      const delta = baseDelta * Math.max(0.15, weight);
+      updateCellEvidence(gx, gy, delta, stamp);
+    }
+  }
 }
 
 function markRadarObservation(){
-  markRobotCell();
+  maintainOccupancy();
 
   const pose = state.status.pose;
   const detectedDistance = clamp(state.currentEchoRange, 0.0, MAX_SENSOR_RANGE);
   const obstacleDetected = detectedDistance < (MAX_SENSOR_RANGE - RADAR_EPSILON);
   const angle = pose.angle_deg * Math.PI / 180.0;
+  const dirX = Math.sin(angle);
+  const dirY = Math.cos(angle);
+  const perpX = Math.cos(angle);
+  const perpY = -Math.sin(angle);
+  const stamp = Date.now();
 
-  let distance = 0.0;
   const freeLimit = obstacleDetected
-    ? Math.max(0, detectedDistance - CELL_WORLD_SIZE)
+    ? Math.max(0, detectedDistance - CELL_WORLD_SIZE * 1.4)
     : detectedDistance;
 
-  while(distance <= freeLimit){
-    const x = pose.x + Math.sin(angle) * distance;
-    const y = pose.y + Math.cos(angle) * distance;
-    const {gx, gy} = worldToGrid(x, y);
+  for(let distance = 0; distance <= freeLimit; distance += CELL_WORLD_SIZE * 0.7){
+    const beamHalfWidth = clamp(0.015 + distance * 0.10, 0.015, 0.07);
+    const lateralOffsets = distance < 0.06
+      ? [0]
+      : [-beamHalfWidth * 0.65, 0, beamHalfWidth * 0.65];
 
-    if(!inGrid(gx, gy)) break;
-    setCellIfUnknownOrFree(gx, gy, 1);
-    distance += CELL_WORLD_SIZE;
+    for(const lateral of lateralOffsets){
+      const x = pose.x + dirX * distance + perpX * lateral;
+      const y = pose.y + dirY * distance + perpY * lateral;
+      const {gx, gy} = worldToGrid(x, y);
+      if(!inGrid(gx, gy)) continue;
+      const delta = lateral === 0 ? LOG_ODDS_FREE : LOG_ODDS_FREE_SIDE;
+      updateCellEvidence(gx, gy, delta, stamp);
+    }
   }
 
   if(obstacleDetected){
-    const obstacleX = pose.x + Math.sin(angle) * detectedDistance;
-    const obstacleY = pose.y + Math.cos(angle) * detectedDistance;
-    const {gx, gy} = worldToGrid(obstacleX, obstacleY);
+    const obstacleX = pose.x + dirX * detectedDistance;
+    const obstacleY = pose.y + dirY * detectedDistance;
 
-    if(inGrid(gx, gy)){
-      const key = cellKey(gx, gy);
-      const existing = state.occupancy.get(key);
-      if(!existing || existing.value !== 2){
-        state.occupancy.set(key, {gx, gy, value: 3, touchedAt: Date.now()});
-      }
+    const mainRadius = clamp(0.035 + detectedDistance * 0.10, 0.04, 0.09);
+    stampObstacleBlob(obstacleX, obstacleY, mainRadius, detectedDistance < 0.20 ? LOG_ODDS_OCC_NEAR : LOG_ODDS_OCC);
+
+    // Un peu de masse derrière le premier écho pour que l'objet ressemble à un bloc
+    const behindSteps = [CELL_WORLD_SIZE * 0.8, CELL_WORLD_SIZE * 1.6];
+    behindSteps.forEach((behind, index) => {
+      const bx = obstacleX - dirX * behind;
+      const by = obstacleY - dirY * behind;
+      stampObstacleBlob(bx, by, Math.max(CELL_WORLD_SIZE * 1.2, mainRadius * (0.78 - index * 0.12)), LOG_ODDS_OCC * (0.58 - index * 0.16));
+    });
+  }
+}
+
+function probabilityAtWorld(x, y){
+  const {gx, gy} = worldToGrid(x, y);
+  const cell = getCell(gx, gy, false);
+  return cell ? cell.prob : 50;
+}
+
+function estimateRangeFromMap(rayAngle){
+  let bestSoft = MAX_SENSOR_RANGE;
+
+  for(let d = CELL_WORLD_SIZE * 0.5; d <= MAX_SENSOR_RANGE; d += CELL_WORLD_SIZE * 0.5){
+    const x = state.status.pose.x + Math.sin(rayAngle) * d;
+    const y = state.status.pose.y + Math.cos(rayAngle) * d;
+    if(x < 0 || x > state.worldW || y < 0 || y > state.worldH) return d;
+
+    const p = probabilityAtWorld(x, y);
+    if(p >= VIEW_HIT_PROB) return d;
+    if(p >= VIEW_SOFT_PROB){
+      bestSoft = Math.min(bestSoft, d + (VIEW_HIT_PROB - p) / (VIEW_HIT_PROB - VIEW_SOFT_PROB) * CELL_WORLD_SIZE * 2);
     }
   }
+
+  return bestSoft < MAX_SENSOR_RANGE ? bestSoft : MAX_SENSOR_RANGE;
 }
 
 function drawGrid(ctx, canvas){
@@ -313,21 +431,22 @@ function drawGrid(ctx, canvas){
 
 function drawOccupancy(ctx, canvas){
   const scale = worldToCanvas(0, 0, canvas).scale;
-  const cellPx = Math.max(1, CELL_WORLD_SIZE * scale);
+  const cellPx = Math.max(2, CELL_WORLD_SIZE * scale);
 
   for(const cell of state.occupancy.values()){
+    const confidence = Math.abs(cell.prob - 50);
+    if(confidence < PROB_MIN_DRAW) continue;
+
     const x = (cell.gx + 0.5) * CELL_WORLD_SIZE;
     const y = (cell.gy + 0.5) * CELL_WORLD_SIZE;
     const c = worldToCanvas(x, y, canvas);
 
-    if(cell.value === 1){
-      ctx.fillStyle = 'rgba(0, 200, 200, 0.7)';
-    } else if(cell.value === 2){
-      ctx.fillStyle = 'rgba(0, 120, 120, 0.95)';
-    } else if(cell.value === 3){
-      ctx.fillStyle = 'rgba(220, 40, 40, 0.95)';
+    if(cell.prob >= 50){
+      const alpha = clamp((cell.prob - 50) / 50, 0.14, 0.95);
+      ctx.fillStyle = `rgba(220, 40, 40, ${alpha})`;
     } else {
-      continue;
+      const alpha = clamp((50 - cell.prob) / 50, 0.10, 0.82);
+      ctx.fillStyle = `rgba(0, 200, 200, ${alpha})`;
     }
 
     ctx.fillRect(c.x - cellPx / 2, c.y - cellPx / 2, cellPx, cellPx);
@@ -410,17 +529,27 @@ function drawRobotView(){
   const ctx = canvas.getContext('2d');
 
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = '#ffffff';
+  ctx.fillStyle = '#071638';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   const barWidth = canvas.width / FPS_BAR_COUNT;
-  const normalized = clamp(1.0 - state.currentEchoRange, 0, 1); // fidèle au index.js
+  const poseAngle = state.status.pose.angle_deg * Math.PI / 180.0;
+  const directNormalized = clamp(1 - (state.currentEchoRange / MAX_SENSOR_RANGE), 0, 1);
 
   for(let i = 0; i < FPS_BAR_COUNT; i++){
-    const value = Math.max(0.1, normalized * (1 - Math.abs(i - 5) * 0.08));
-    const h = value * canvas.height * 0.9;
+    const t = FPS_BAR_COUNT === 1 ? 0.5 : i / (FPS_BAR_COUNT - 1);
+    const rayAngle = poseAngle + lerp(-VIEW_FOV_RAD / 2, VIEW_FOV_RAD / 2, t);
+    const rangeFromMap = estimateRangeFromMap(rayAngle);
+    const mapNormalized = clamp(1 - (rangeFromMap / MAX_SENSOR_RANGE), 0, 1);
+    const centerWeight = Math.max(0, 1 - Math.abs(i - (FPS_BAR_COUNT - 1) / 2) * 0.32);
+    const directContribution = directNormalized * centerWeight;
+    const target = Math.max(0.05, Math.max(mapNormalized, directContribution));
 
-    ctx.fillStyle = 'rgba(255, 120, 120, 0.9)';
+    state.fpsView[i] = state.fpsView[i] * 0.48 + target * 0.52;
+
+    const h = state.fpsView[i] * canvas.height * 0.88;
+    const intensity = clamp(0.22 + state.fpsView[i] * 0.95, 0.22, 1);
+    ctx.fillStyle = `rgba(255, 120, 120, ${intensity})`;
     ctx.fillRect(
       i * barWidth + 4,
       (canvas.height - h) / 2,
@@ -429,11 +558,11 @@ function drawRobotView(){
     );
   }
 
-  ctx.strokeStyle = '#000';
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
   ctx.lineWidth = 1;
   ctx.strokeRect(0, 0, canvas.width, canvas.height);
 
-  ctx.fillStyle = '#000';
+  ctx.fillStyle = '#ffffff';
   ctx.font = '18px Arial';
   ctx.fillText(
     `Distance: ${state.status.distance_m == null ? '--' : state.status.distance_m.toFixed(2) + ' m'}`,
@@ -448,7 +577,8 @@ function renderStatus(){
   const robotTxt = s.robot_available ? 'ok' : '--';
   const sensorTxt = s.sensor_available ? 'ok' : '--';
   const dist = s.distance_m == null ? '--' : `${s.distance_m.toFixed(3)} m`;
-  const occCount = Array.from(state.occupancy.values()).filter(c => c.value === 3).length;
+  const probableWalls = Array.from(state.occupancy.values()).filter(c => c.prob >= 65).length;
+  const observedCells = Array.from(state.occupancy.values()).filter(c => Math.abs(c.prob - 50) >= PROB_MIN_DRAW).length;
   const err = s.last_error ? `<div style="color:#cc241d;font-weight:700">Erreur : ${s.last_error}</div>` : '';
 
   qs('#statusText').innerHTML = `
@@ -460,12 +590,14 @@ function renderStatus(){
     <div>Y : ${s.pose.y.toFixed(2)} m</div>
     <div>Angle : ${s.pose.angle_deg.toFixed(1)} °</div>
     <div>Distance : ${dist}</div>
-    <div>Cases obstacle : ${occCount}</div>
+    <div>Cases observées : ${observedCells}</div>
+    <div>Murs probables (&ge;65%) : ${probableWalls}</div>
     ${err}
   `;
 }
 
 function redrawAll(){
+  maintainOccupancy();
   renderStatus();
   drawMap();
   drawRobotView();
@@ -515,9 +647,10 @@ function bind(){
     state.lastTracePoint = null;
     state.destination = null;
     state.occupancy = new Map();
+    state.fpsView = new Array(FPS_BAR_COUNT).fill(0.06);
     state.currentCommand = 'stop';
     socket.emit('resetPose');
-    addLog('Pose reset + radar effacé');
+    addLog('Pose reset + carte probabiliste effacée');
     redrawAll();
   };
 
@@ -597,6 +730,7 @@ socket.on('echoRangeUpdate', data => {
 
 bind();
 redrawAll();
+setInterval(redrawAll, 1200);
 </script>
 </body>
 </html>

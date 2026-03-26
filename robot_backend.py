@@ -20,7 +20,7 @@ WORLD_W = 6.0
 WORLD_H = 6.0
 
 LINEAR_SPEED = 0.10      # m/s
-ANGULAR_SPEED = 1.22     # rad/s
+ANGULAR_SPEED = 1.42     # rad/s
 MAX_SENSOR_RANGE = 1.0
 
 app = Flask(__name__)
